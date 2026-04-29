@@ -2122,6 +2122,7 @@ impl<'a> Orchestrator<'a> {
         }
 
         state.triggered_leg = Some(filled_leg);
+        self.maybe_spawn_redeem_watch(managed, "first_match");
         info!(
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
@@ -2220,7 +2221,7 @@ impl<'a> Orchestrator<'a> {
         }
 
         if yes_balance > rust_decimal::Decimal::ZERO || no_balance > rust_decimal::Decimal::ZERO {
-            self.spawn_redeem_task(managed.round.clone());
+            self.maybe_spawn_redeem_watch(managed, "finalize_round");
         }
 
         managed.completed = true;
@@ -2302,6 +2303,22 @@ impl<'a> Orchestrator<'a> {
         });
     }
 
+    fn maybe_spawn_redeem_watch(&self, managed: &mut ManagedRound, reason: &str) {
+        if managed.redeem_task_spawned {
+            return;
+        }
+
+        managed.redeem_task_spawned = true;
+        info!(
+            condition_id = %managed.round.condition_id,
+            market_slug = %managed.round.market_slug,
+            reason,
+            settles_at = %managed.round.settles_at,
+            "registered auto-redeem watcher for round"
+        );
+        self.spawn_redeem_task(managed.round.clone());
+    }
+
     fn live_gateway(&self) -> Result<&ExecutionGateway> {
         self.execution_gateway
             .as_deref()
@@ -2329,6 +2346,7 @@ struct ManagedRound {
     orders: Vec<ManagedOrder>,
     paper_state: Option<PaperRoundState>,
     open_post_state: Option<OpenPostRoundState>,
+    redeem_task_spawned: bool,
     cancel_processed: bool,
     completed: bool,
 }
@@ -2344,6 +2362,7 @@ impl ManagedRound {
             orders: Vec::new(),
             paper_state: None,
             open_post_state: Some(OpenPostRoundState::new()),
+            redeem_task_spawned: false,
             cancel_processed: false,
             completed: false,
         }
