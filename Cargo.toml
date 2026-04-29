@@ -1,0 +1,23 @@
+[package]
+name = "pm_alpha_1_0"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "1.0.42", default-features = false, features = ["contract", "provider-http", "reqwest-rustls-tls", "dyn-abi", "signer-local", "signers", "sol-types"] }
+anyhow = "1.0.95"
+base64 = "0.22.1"
+chrono = { version = "0.4.42", features = ["serde"] }
+futures-util = "0.3.31"
+hmac = "0.12.1"
+rand = "0.9.2"
+reqwest = { version = "0.12.15", default-features = false, features = ["http2", "json", "rustls-tls"] }
+rust_decimal = { version = "1.39.0", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.24.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+toml = "0.8.23"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }

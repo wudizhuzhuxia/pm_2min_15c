@@ -1,0 +1,100 @@
+# BTC 5m 开盘后双边 15c 策略示例
+# 这份配置按你的需求预设：
+# - PM BTC 5m
+# - 开盘后立即双边挂买
+# - YES / NO 都挂 0.15
+# - 开盘后 2 分钟内有效
+# - PM 自身价格相对本场开盘价偏离超过 50 美元就撤单
+# - 任意一边部分成交后立刻撤另一边
+
+[app]
+instance_name = "btc-5m-open-post-15c"
+dry_run = false
+log_level = "info"
+
+[network]
+clob_rest_url = "https://clob.polymarket.com"
+relayer_rest_url = "https://relayer-v2.polymarket.com"
+gamma_rest_url = "https://gamma-api.polymarket.com"
+data_api_url = "https://data-api.polymarket.com"
+polygon_rpc_url_env = "POLYGON_RPC_URL"
+prefer_http2 = true
+connect_timeout_ms = 300
+request_timeout_ms = 1200
+keepalive_interval_secs = 20
+transaction_timeout_secs = 45
+tcp_nodelay = true
+
+[market]
+series_slug = "btc-5m"
+discovery_lookahead_secs = 1200
+
+[strategy]
+mode = "open_post_dual_buy_price_guard"
+round_interval_secs = 300
+window_size_rounds = 2
+quote_start_before_open_secs = 180
+quote_cancel_before_open_ms = 1000
+pre_split_before_open_secs = 240
+quote_start_after_open_secs = 0
+quote_cancel_after_open_secs = 120
+order_size = 5.0
+yes_price = 0.15
+no_price = 0.15
+open_price_max_deviation = 50.0
+reactive_opposite_taker_usdc = 2.0
+reactive_buy_slippage_ticks = 2
+paper_extra_shares = 10.0
+paper_stop_loss_price = 0.50
+paper_take_profit_percents = [5.0, 10.0, 15.0, 20.0]
+paper_limit_exit_price = 0.50
+paper_force_taker_exit_before_settle_secs = 120
+paper_fee_rebate_rate = 0.30
+paper_output_dir = "logs/paper"
+
+[execution]
+max_batch_orders = 15
+clob_execution_mode = "rust"
+clob_helper_python_bin = "python3"
+clob_helper_script = "scripts/clob_helper.py"
+onchain_execution_mode = "rpc"
+refresh_metadata_on_start = true
+auto_approve_ctf = true
+auto_approve_collateral = true
+relayer_require_safe_deployed = true
+relayer_poll_interval_ms = 2000
+tick_size = "0.01"
+neg_risk = false
+fee_rate_bps = 0
+settled_redeem_scan_enabled = true
+settled_redeem_scan_interval_secs = 60
+settled_redeem_scan_lookback_secs = 21600
+
+[routing]
+primary_account = "acc1"
+
+[telemetry]
+log_json = true
+
+[telegram]
+enabled = false
+bot_token_env = "PM_TELEGRAM_BOT_TOKEN"
+chat_ids = []
+send_startup = true
+send_shutdown = true
+send_errors = true
+disable_link_preview = true
+parse_mode = ""
+
+[[accounts]]
+name = "acc1"
+enabled = true
+chain_id = 137
+funder_address = ""
+signature_type = "eoa"
+private_key_env = "PM_ACC1_PRIVATE_KEY"
+api_key_env = "PM_ACC1_API_KEY"
+api_secret_env = "PM_ACC1_API_SECRET"
+api_passphrase_env = "PM_ACC1_API_PASSPHRASE"
+relayer_api_key_env = "PM_ACC1_RELAYER_API_KEY"
+relayer_api_key_address_env = "PM_ACC1_RELAYER_API_KEY_ADDRESS"

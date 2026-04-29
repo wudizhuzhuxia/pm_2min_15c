@@ -1,0 +1,23 @@
+[Unit]
+Description=PM Alpha Polymarket BTC 5m Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/pm-alpha/repo
+EnvironmentFile=/opt/pm-alpha/env/pm-alpha.env
+Environment=PM_CONFIG=/opt/pm-alpha/repo/config/pm-alpha.toml
+ExecStart=/opt/pm-alpha/repo/target/release/pm_alpha_1_0
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

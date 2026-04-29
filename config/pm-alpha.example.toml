@@ -1,0 +1,262 @@
+# PM Alpha 示例配置
+# 这个版本只保留当前代码真正会使用的参数。
+# 机器人只管理“未来两轮”，不会接管当前已经开盘的场次。
+
+[app]
+# instance_name: 实例名，只用于日志和通知里区分不同进程。
+instance_name = "btc-5m-pm-bot"
+
+# dry_run: true 表示只打印计划动作，不真的 split / 下单 / 撤单 / merge / redeem。
+dry_run = false
+
+# log_level: 日志级别，常用 info / debug / warn。
+log_level = "info"
+
+[network]
+# clob_rest_url: Polymarket CLOB REST 接口地址，用于下单、撤单、查盘口。
+clob_rest_url = "https://clob.polymarket.com"
+
+# relayer_rest_url: Polymarket relayer 地址，用于代理钱包 gasless 的 approve / split / merge / redeem。
+relayer_rest_url = "https://relayer-v2.polymarket.com"
+
+# gamma_rest_url: 市场发现接口地址，用于发现未来轮次。
+gamma_rest_url = "https://gamma-api.polymarket.com"
+
+# data_api_url: Data API 地址，用于后台扫描可 redeem 的已结算仓位。
+data_api_url = "https://data-api.polymarket.com"
+
+# polygon_rpc_url_env: Polygon RPC 放在哪个环境变量里。
+polygon_rpc_url_env = "POLYGON_RPC_URL"
+
+# prefer_http2: 是否优先使用 HTTP/2 复用连接。
+prefer_http2 = true
+
+# connect_timeout_ms: 建连超时，毫秒。
+connect_timeout_ms = 200
+
+# request_timeout_ms: 单次 HTTP 请求超时，毫秒。
+request_timeout_ms = 800
+
+# keepalive_interval_secs: HTTP 保活间隔，秒。
+keepalive_interval_secs = 20
+
+# transaction_timeout_secs: 链上或 relayer 交易确认等待超时，秒。
+transaction_timeout_secs = 30
+
+# tcp_nodelay: 是否关闭 Nagle 算法以降低小包延迟。
+tcp_nodelay = true
+
+[market]
+# series_slug: 要交易的系列，例如 btc-5m / btc-15m。
+# round_interval_secs 需要和这个系列的真实周期一致。
+series_slug = "btc-5m"
+
+# discovery_lookahead_secs: 向前看多远去发现未来市场，必须覆盖 window_size_rounds。
+discovery_lookahead_secs = 1200
+
+[strategy]
+# mode:
+# pre_split_dual_sell = 先 split，再在开盘前挂 YES/NO 双边卖单
+# pre_open_dual_buy   = 不 split，直接在开盘前挂 YES/NO 双边买单
+# pre_open_dual_buy_taker_flip = 双边提前挂 46c 买单；某一边整单成交后，立刻 taker 买另一边固定金额，
+# 并 taker 卖掉刚成交的这一边；部分成交不触发，直接持有到结算
+# pre_open_dual_buy_paper_tpsl = 实时模拟盘；盘前双边挂 46c 买单，单边整单成交后，
+# paper taker 买入相反方向的“成交数量 + 额外份数”，并对额外份数按 TP/SL 做模拟，输出日志和盈亏图表
+# open_post_dual_buy_price_guard = 开盘后立即双边挂买单；只要仍在开盘后窗口内且 PM 自身价格
+# 相对本场开盘价偏移不超过阈值，就保留挂单；任意一边部分成交后立刻撤另一边
+mode = "pre_open_dual_buy_taker_flip"
+
+# round_interval_secs: 每轮市场长度，5 分钟市场填 300，15 分钟市场填 900。
+round_interval_secs = 300
+
+# window_size_rounds: 只维护未来多少轮。你的需求是固定滚动两轮，所以默认 2。
+window_size_rounds = 2
+
+# quote_start_before_open_secs: 距离开盘多少秒开始允许挂单。
+# 例如填 180，表示开盘前 3 分钟开始挂单。
+quote_start_before_open_secs = 180
+
+# quote_cancel_before_open_ms: 距离开盘多少毫秒撤掉本场次所有未成交部分。
+# 例如 1000 表示开盘前 1 秒撤。
+quote_cancel_before_open_ms = 1000
+
+# pre_split_before_open_secs: 仅 pre_split_dual_sell 模式有效。
+# 表示距离开盘多少秒开始先做 split，通常应大于等于 quote_start_before_open_secs，
+# 让 split 有时间确认完成，然后再挂单。
+pre_split_before_open_secs = 240
+
+# quote_start_after_open_secs: 仅 open_post_dual_buy_price_guard 模式有效。
+# 表示开盘后多少秒开始挂单；默认 0 表示开盘就挂。
+quote_start_after_open_secs = 0
+
+# quote_cancel_after_open_secs: 仅 open_post_dual_buy_price_guard 模式有效。
+# 表示开盘后最多保留挂单多久；例如 120 表示开盘后 2 分钟撤掉所有未成交部分。
+quote_cancel_after_open_secs = 120
+
+# order_size:
+# pre_split_dual_sell 模式下表示每条腿的挂卖数量，同时也是默认 split 数量。
+# pre_open_dual_buy / pre_open_dual_buy_taker_flip / pre_open_dual_buy_paper_tpsl 模式下表示每条腿的挂买数量。
+order_size = 5.0
+
+# yes_price / no_price:
+# 两条腿各自的挂单价格。
+# pre_split_dual_sell 模式下通常是卖价，比如 0.54。
+# pre_open_dual_buy / pre_open_dual_buy_taker_flip / pre_open_dual_buy_paper_tpsl /
+# open_post_dual_buy_price_guard 模式下通常是买价，比如 0.46 或 0.15。
+yes_price = 0.46
+no_price = 0.46
+
+# open_price_max_deviation:
+# 仅 open_post_dual_buy_price_guard 模式有效。
+# PM 当前参考价格相对该场次开盘参考价格允许偏离的最大美元数；超出后撤销所有未成交挂单。
+open_price_max_deviation = 50.0
+
+# reactive_opposite_taker_usdc:
+# 仅 pre_open_dual_buy_taker_flip 模式有效。
+# 表示某一边 maker 买单“整单成交”后，立刻用 taker 去买另一边的固定 USDC 金额。
+# 默认按你的要求先设为 2 USDC。
+reactive_opposite_taker_usdc = 2.0
+
+# reactive_buy_slippage_ticks:
+# 仅 pre_open_dual_buy_taker_flip 模式有效。
+# reactive taker 买入时，在实时 best ask 基础上额外放宽几个 tick 作为滑点容忍。
+# 例如 best ask=0.51、tick_size=0.01、这里设 2，则 taker buy limit 会用 0.53。
+reactive_buy_slippage_ticks = 2
+
+# paper_extra_shares:
+# 仅 pre_open_dual_buy_paper_tpsl 模式有效。
+# 盘前某一边 maker 整单成交 N 份后，paper taker 会买入相反方向的 N + paper_extra_shares 份。
+paper_extra_shares = 10.0
+
+# paper_stop_loss_price:
+# 仅 pre_open_dual_buy_paper_tpsl 模式有效。
+# 额外那部分仓位的统一止损线；当实时 best bid 跌破这个价格时，paper taker 市价卖出剩余额外仓位。
+paper_stop_loss_price = 0.50
+
+# paper_take_profit_percents:
+# 仅 pre_open_dual_buy_paper_tpsl 模式有效。
+# 不是分批止盈，而是并行跑多组模拟分支。
+# 例如 [5, 10, 15, 20] 表示分别测试 +5% / +10% / +15% / +20% 触发时把额外仓位一次性全部卖出。
+paper_take_profit_percents = [5.0, 10.0, 15.0, 20.0]
+
+# paper_fee_rebate_rate:
+# 仅 pre_open_dual_buy_paper_tpsl 模式有效。
+# 用于生成第二套“含手续费返还”的模拟净值口径。
+# 例如 0.30 表示返还 30% 手续费。
+paper_fee_rebate_rate = 0.30
+
+# paper_output_dir:
+# 仅 pre_open_dual_buy_paper_tpsl 模式有效。
+# 实时模拟盘输出目录。程序会在这个目录下再按启动时间创建 session 子目录，
+# 里面包含 paper_events.jsonl、paper_branch_summaries.csv、paper_pnl_normal.svg、paper_pnl_rebate.svg。
+paper_output_dir = "logs/paper"
+
+[execution]
+# max_batch_orders: 单次批量下单最大数量。Polymarket 当前上限是 15。
+max_batch_orders = 15
+
+# clob_execution_mode:
+# rust          = 使用当前 Rust 实现签名并下单
+# python_helper = 调用 scripts/clob_helper.py
+clob_execution_mode = "rust"
+
+# clob_helper_python_bin: python_helper 模式下使用的 Python 解释器。
+clob_helper_python_bin = "python3"
+
+# clob_helper_script: python_helper 模式下调用的脚本路径。
+clob_helper_script = "scripts/clob_helper.py"
+
+# onchain_execution_mode:
+# rpc     = 适合普通 EOA 钱包
+# relayer = 适合 Polymarket 代理钱包 / SAFE
+onchain_execution_mode = "rpc"
+
+# refresh_metadata_on_start: 启动时是否主动刷新 tick_size / fee_rate / neg_risk。
+refresh_metadata_on_start = true
+
+# auto_approve_ctf: 是否自动做 CTF operator 授权。
+auto_approve_ctf = true
+
+# auto_approve_collateral: 是否自动做 USDC allowance 授权。
+auto_approve_collateral = true
+
+# relayer_require_safe_deployed: 使用 relayer 时，是否要求 SAFE 已部署。
+relayer_require_safe_deployed = true
+
+# relayer_poll_interval_ms: relayer 轮询交易状态间隔，毫秒。
+relayer_poll_interval_ms = 2000
+
+# tick_size / neg_risk / fee_rate_bps:
+# 仅当 refresh_metadata_on_start = false 时，才用本地静态值兜底。
+tick_size = "0.01"
+neg_risk = false
+fee_rate_bps = 0
+
+# settled_redeem_scan_enabled:
+# 是否开启后台补扫。即使主流程漏掉 redeem，这个补扫也会周期性尝试补领已结算仓位。
+settled_redeem_scan_enabled = true
+
+# settled_redeem_scan_interval_secs: 后台补扫间隔。
+settled_redeem_scan_interval_secs = 60
+
+# settled_redeem_scan_lookback_secs: 后台补扫时，最多回看多少秒内的已结算轮次。
+settled_redeem_scan_lookback_secs = 21600
+
+[routing]
+# primary_account: 默认主账号名，必须和某个 [[accounts]].name 一致。
+primary_account = "acc1"
+
+[telemetry]
+# log_json: true 输出 JSON 日志，适合 journalctl / Loki / ELK。
+log_json = true
+
+[telegram]
+# enabled: 是否启用 Telegram 通知。
+enabled = false
+
+# bot_token_env: Telegram bot token 所在环境变量名。
+bot_token_env = "PM_TELEGRAM_BOT_TOKEN"
+
+# chat_ids: 接收通知的 chat id 列表。enabled = true 时必须至少填一个。
+chat_ids = []
+
+# send_startup / send_shutdown / send_errors: 是否发送对应通知。
+send_startup = true
+send_shutdown = true
+send_errors = true
+
+# disable_link_preview: 是否关闭链接预览。
+disable_link_preview = true
+
+# parse_mode: 为空表示纯文本；如需 Markdown/HTML 可自行调整。
+parse_mode = ""
+
+[[accounts]]
+# name: 账号名，供 routing.primary_account 引用。
+name = "acc1"
+
+# enabled: 是否启用该账号。
+enabled = true
+
+# chain_id: Polygon 主网是 137。
+chain_id = 137
+
+# signature_type:
+# eoa           = 普通私钥地址
+# magic         = Magic 钱包
+# browser_proxy = Polymarket 普通 proxy wallet 场景
+# gnosis_safe   = Polymarket SAFE / relayer 场景
+signature_type = "eoa"
+
+# funder_address:
+# 真正持有仓位和资金的钱包地址。
+# EOA 场景通常可留空，代码会默认使用 signer 地址。
+funder_address = ""
+
+# 以下参数都是“环境变量名”，不是直接把密钥写进 TOML。
+private_key_env = "PM_ACC1_PRIVATE_KEY"
+api_key_env = "PM_ACC1_API_KEY"
+api_secret_env = "PM_ACC1_API_SECRET"
+api_passphrase_env = "PM_ACC1_API_PASSPHRASE"
+relayer_api_key_env = "PM_ACC1_RELAYER_API_KEY"
+relayer_api_key_address_env = "PM_ACC1_RELAYER_API_KEY_ADDRESS"

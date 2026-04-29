@@ -1,0 +1,8 @@
+/target
+.DS_Store
+.env
+.env.*
+*.log
+config/pm-alpha.toml
+*.pem
+*.key
