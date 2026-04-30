@@ -70,6 +70,12 @@ impl Settings {
             bail!("strategy.no_price must be greater than 0 and less than or equal to 1");
         }
 
+        if self.strategy.open_price_observation_max_deviation < 0.0 {
+            bail!(
+                "strategy.open_price_observation_max_deviation must be greater than or equal to zero"
+            );
+        }
+
         if self.strategy.open_price_max_deviation < 0.0 {
             bail!("strategy.open_price_max_deviation must be greater than or equal to zero");
         }
@@ -364,6 +370,7 @@ pub struct StrategyConfig {
     pub order_size: f64,
     pub yes_price: f64,
     pub no_price: f64,
+    pub open_price_observation_max_deviation: f64,
     pub open_price_max_deviation: f64,
     pub reactive_opposite_taker_usdc: f64,
     pub reactive_buy_slippage_ticks: u32,
@@ -385,11 +392,12 @@ impl Default for StrategyConfig {
             quote_start_before_open_secs: 180,
             quote_cancel_before_open_ms: 1_000,
             pre_split_before_open_secs: 240,
-            quote_start_after_open_secs: 0,
+            quote_start_after_open_secs: 60,
             quote_cancel_after_open_secs: 120,
             order_size: 5.0,
             yes_price: 0.54,
             no_price: 0.54,
+            open_price_observation_max_deviation: 80.0,
             open_price_max_deviation: 50.0,
             reactive_opposite_taker_usdc: 2.0,
             reactive_buy_slippage_ticks: 2,

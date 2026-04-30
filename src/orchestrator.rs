@@ -307,6 +307,19 @@ impl<'a> Orchestrator<'a> {
             self.maybe_split_round(strategy, managed).await?;
         }
 
+        if strategy.uses_open_post_price_guard()
+            && !managed.completed
+            && !managed.cancel_processed
+            && now >= managed.round.opens_at
+            && now < round_cancel_at(&managed.round, strategy)
+        {
+            self.refresh_open_reference_snapshot(managed).await?;
+            self.apply_open_post_observation_gate(strategy, managed)?;
+            if managed.completed || managed.cancel_processed {
+                return Ok(());
+            }
+        }
+
         if !managed.orders_submitted
             && now >= round_quote_start_at(&managed.round, strategy)
             && now < round_cancel_at(&managed.round, strategy)
@@ -1479,60 +1492,66 @@ impl<'a> Orchestrator<'a> {
         strategy: &StrategySnapshot,
         managed: &mut ManagedRound,
     ) -> Result<()> {
-        if !strategy.uses_open_post_price_guard() || self.settings.app.dry_run {
+        if !strategy.uses_open_post_price_guard() {
             return Ok(());
         }
 
         self.refresh_open_reference_snapshot(managed).await?;
+        self.apply_open_post_observation_gate(strategy, managed)?;
+        if managed.completed || managed.cancel_processed {
+            return Ok(());
+        }
 
-        let gateway = self.live_gateway()?;
         let mut first_matched_leg = None;
 
-        for order in &mut managed.orders {
-            if !order.needs_status_poll() {
-                continue;
-            }
+        if !self.settings.app.dry_run {
+            let gateway = self.live_gateway()?;
+            for order in &mut managed.orders {
+                if !order.needs_status_poll() {
+                    continue;
+                }
 
-            let Some(order_id) = order.order_id.clone() else {
-                continue;
-            };
+                let Some(order_id) = order.order_id.clone() else {
+                    continue;
+                };
 
-            let status = match gateway.fetch_order_status(&order_id).await {
-                Ok(Some(status)) => status,
-                Ok(None) => continue,
-                Err(error) => {
-                    warn!(
-                        ?error,
+                let status = match gateway.fetch_order_status(&order_id).await {
+                    Ok(Some(status)) => status,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            condition_id = %managed.round.condition_id,
+                            market_slug = %managed.round.market_slug,
+                            leg = leg_label(order.leg),
+                            side = side_label(order.side),
+                            order_id,
+                            "failed to poll maker order status during open-post monitoring"
+                        );
+                        continue;
+                    }
+                };
+
+                let previous_matched_size = order.last_matched_size;
+                order.observe_status(&status);
+                if order.last_matched_size > previous_matched_size {
+                    info!(
                         condition_id = %managed.round.condition_id,
                         market_slug = %managed.round.market_slug,
                         leg = leg_label(order.leg),
                         side = side_label(order.side),
+                        maker_price = %order.price,
                         order_id,
-                        "failed to poll maker order status during open-post monitoring"
+                        matched_size = %order.last_matched_size,
+                        fully_matched = status.is_fully_matched(),
+                        status = %status.status,
+                        "observed maker order match progress"
                     );
-                    continue;
                 }
-            };
 
-            let previous_matched_size = order.last_matched_size;
-            order.observe_status(&status);
-            if order.last_matched_size > previous_matched_size {
-                info!(
-                    condition_id = %managed.round.condition_id,
-                    market_slug = %managed.round.market_slug,
-                    leg = leg_label(order.leg),
-                    side = side_label(order.side),
-                    maker_price = %order.price,
-                    order_id,
-                    matched_size = %order.last_matched_size,
-                    fully_matched = status.is_fully_matched(),
-                    status = %status.status,
-                    "observed maker order match progress"
-                );
-            }
-
-            if first_matched_leg.is_none() && order.last_matched_size > Decimal::ZERO {
-                first_matched_leg = Some(order.leg);
+                if first_matched_leg.is_none() && order.last_matched_size > Decimal::ZERO {
+                    first_matched_leg = Some(order.leg);
+                }
             }
         }
 
@@ -2109,6 +2128,52 @@ impl<'a> Orchestrator<'a> {
         Ok(true)
     }
 
+    fn apply_open_post_observation_gate(
+        &self,
+        strategy: &StrategySnapshot,
+        managed: &mut ManagedRound,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let Some(state) = managed.open_post_state.as_mut() else {
+            return Ok(());
+        };
+        let Some(snapshot) = state.latest_snapshot.as_ref() else {
+            return Ok(());
+        };
+
+        let drift = (snapshot.current_price - snapshot.open_price).abs();
+        let entry_at = round_quote_start_at(&managed.round, strategy);
+
+        if now >= managed.round.opens_at
+            && now < entry_at
+            && drift >= strategy.open_price_observation_max_deviation
+            && !state.observation_disqualified
+        {
+            state.observation_disqualified = true;
+            warn!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                open_price = %snapshot.open_price,
+                current_price = %snapshot.current_price,
+                drift = %drift,
+                disqualify_drift = %strategy.open_price_observation_max_deviation,
+                "PM price drift hit first-minute observation threshold; skipping this round"
+            );
+        }
+
+        if now >= entry_at && state.observation_disqualified && !managed.completed {
+            managed.completed = true;
+            managed.cancel_processed = true;
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                "round skipped after first-minute observation threshold was breached"
+            );
+        }
+
+        Ok(())
+    }
+
     async fn cancel_opposite_leg_after_first_match(
         &self,
         managed: &mut ManagedRound,
@@ -2374,6 +2439,7 @@ struct OpenPostRoundState {
     triggered_leg: Option<LegSide>,
     latest_snapshot: Option<RoundReferencePriceSnapshot>,
     snapshot_fetched_at: Option<DateTime<Utc>>,
+    observation_disqualified: bool,
     price_guard_failed: bool,
 }
 
@@ -2383,6 +2449,7 @@ impl OpenPostRoundState {
             triggered_leg: None,
             latest_snapshot: None,
             snapshot_fetched_at: None,
+            observation_disqualified: false,
             price_guard_failed: false,
         }
     }
@@ -2817,6 +2884,7 @@ mod tests {
             order_size: Decimal::new(5, 0),
             yes_price: Decimal::new(46, 2),
             no_price: Decimal::new(46, 2),
+            open_price_observation_max_deviation: Decimal::new(80, 0),
             open_price_max_deviation: Decimal::new(50, 0),
             reactive_opposite_taker_usdc: Decimal::ZERO,
             reactive_buy_slippage_ticks: 2,
