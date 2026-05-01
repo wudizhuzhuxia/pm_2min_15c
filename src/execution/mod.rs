@@ -604,7 +604,7 @@ impl ExecutionGateway {
     ) -> Result<RawSignedOrder> {
         let token_id = self.token_id_for_leg(round, leg)?;
         self.build_market_buy_order_by_quote(token_id, price, quote_amount, order_type)
-        .await
+            .await
     }
 
     async fn build_market_buy_order_by_quote(
@@ -785,6 +785,14 @@ impl ExecutionGateway {
         }
     }
 
+    pub async fn fetch_open_orders(
+        &self,
+        market: Option<&str>,
+        asset_id: Option<&str>,
+    ) -> Result<Vec<OpenOrderResponse>> {
+        self.fetch_open_orders_python_helper(market, asset_id).await
+    }
+
     pub async fn fetch_order_status(&self, order_id: &str) -> Result<Option<OrderStatusResponse>> {
         let path = format!("/data/order/{order_id}");
         let mut request = self
@@ -915,6 +923,24 @@ impl ExecutionGateway {
             order_ids: order_ids.iter().map(|id| (*id).to_owned()).collect(),
         };
         self.run_python_helper("cancel-orders", &request).await
+    }
+
+    async fn fetch_open_orders_python_helper(
+        &self,
+        market: Option<&str>,
+        asset_id: Option<&str>,
+    ) -> Result<Vec<OpenOrderResponse>> {
+        let request = PythonHelperGetOpenOrdersRequest {
+            host: self.clob_base_url.clone(),
+            chain_id: self.account.chain_id,
+            private_key: self.account.private_key.clone(),
+            signature_type: signature_type_code(self.account.signature_type),
+            funder: self.account.funder_address.to_checksum(None),
+            creds: PythonHelperApiCredentials::from_account(&self.account),
+            market: market.map(str::to_owned),
+            asset_id: asset_id.map(str::to_owned),
+        };
+        self.run_python_helper("get-open-orders", &request).await
     }
 
     async fn run_python_helper<T, R>(&self, action: &str, payload: &T) -> Result<R>
@@ -1077,7 +1103,10 @@ impl ExecutionGateway {
             }
 
             if attempt < MAX_BALANCE_CLEAR_CHECKS {
-                sleep(Duration::from_millis(self.config.relayer_poll_interval_ms.max(250))).await;
+                sleep(Duration::from_millis(
+                    self.config.relayer_poll_interval_ms.max(250),
+                ))
+                .await;
             } else {
                 bail!(
                     "redeem transaction completed but token balances remain for condition {} (yes_balance={}, no_balance={})",
@@ -1288,7 +1317,7 @@ impl ExecutionGateway {
                 };
 
                 self.submit_relayer_safe_transaction(collateral, approval.abi_encode(), "approve")
-                .await?;
+                    .await?;
             }
         }
 
@@ -1521,12 +1550,7 @@ impl ExecutionGateway {
         );
 
         let pending = conditional_tokens
-            .redeemPositions(
-                collateral,
-                FixedBytes::<32>::ZERO,
-                condition_id,
-                index_sets,
-            )
+            .redeemPositions(collateral, FixedBytes::<32>::ZERO, condition_id, index_sets)
             .send()
             .await
             .context("failed to submit redeemPositions transaction")?;
@@ -2113,6 +2137,18 @@ struct PythonHelperCancelOrdersRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PythonHelperGetOpenOrdersRequest {
+    host: String,
+    chain_id: ChainId,
+    private_key: String,
+    signature_type: u8,
+    funder: String,
+    creds: PythonHelperApiCredentials,
+    market: Option<String>,
+    asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct PythonHelperOrder {
     token_id: String,
     price: String,
@@ -2259,6 +2295,34 @@ impl OrderStatusResponse {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenOrderResponse {
+    #[serde(default, alias = "id", alias = "orderID", alias = "orderId")]
+    pub id: String,
+    #[serde(default, alias = "asset_id", alias = "assetId")]
+    pub asset_id: String,
+    #[serde(default)]
+    pub market: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, deserialize_with = "deserialize_decimal_option")]
+    pub price: Option<Decimal>,
+    #[serde(
+        default,
+        alias = "original_size",
+        deserialize_with = "deserialize_decimal_option"
+    )]
+    pub original_size: Option<Decimal>,
+    #[serde(
+        default,
+        alias = "size_matched",
+        deserialize_with = "deserialize_decimal_option"
+    )]
+    pub size_matched: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2834,12 +2898,10 @@ mod tests {
                 expiration: "0".to_owned(),
                 signature_type: 1,
                 timestamp: "1746124800000".to_owned(),
-                metadata:
-                    "0x0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_owned(),
-                builder:
-                    "0x0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_owned(),
+                metadata: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+                builder: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
                 signature: "0xabc".to_owned(),
             },
             owner: "api-key".to_owned(),

@@ -12,9 +12,10 @@ use tracing::{debug, info, warn};
 use crate::{
     config::{Settings, StrategyMode},
     execution::{
-        ExecutionGateway, OrderBookResponse, OrderStatusResponse, OrderType, PostOrderResponse,
+        ExecutionGateway, OpenOrderResponse, OrderBookResponse, OrderStatusResponse, OrderType,
+        PostOrderResponse,
     },
-    market::{MarketDiscoveryService, RoundDescriptor, RoundReferencePriceSnapshot},
+    market::{MarketDiscoveryService, RoundDescriptor},
     notifier::Notifier,
     paper::{
         PaperBranchState, PaperExitReason, PaperLimitExitPosition, PaperMakerOrder,
@@ -31,7 +32,7 @@ const REDEEM_RETRY_LIMIT: usize = 900;
 const REACTIVE_SELL_BALANCE_POLL_MS: u64 = 150;
 const REACTIVE_SELL_SETTLEMENT_GRACE_MS: i64 = 2_000;
 const REACTIVE_BEST_QUOTE_MAX_STALENESS_MS: i64 = 1_500;
-const OPEN_PRICE_SNAPSHOT_MIN_POLL_MS: i64 = 750;
+const SUBMISSION_RECOVERY_POLL_MS: i64 = 750;
 
 pub struct Orchestrator<'a> {
     settings: &'a Settings,
@@ -307,24 +308,19 @@ impl<'a> Orchestrator<'a> {
             self.maybe_split_round(strategy, managed).await?;
         }
 
-        if strategy.uses_open_post_price_guard()
-            && !managed.completed
-            && !managed.cancel_processed
-            && now >= managed.round.opens_at
-            && now < round_cancel_at(&managed.round, strategy)
-        {
-            self.refresh_open_reference_snapshot(managed).await?;
-            self.apply_open_post_observation_gate(strategy, managed)?;
-            if managed.completed || managed.cancel_processed {
-                return Ok(());
-            }
-        }
-
         if !managed.orders_submitted
+            && !managed.submission_attempted
             && now >= round_quote_start_at(&managed.round, strategy)
             && now < round_cancel_at(&managed.round, strategy)
         {
             self.maybe_submit_orders(strategy, managed).await?;
+        }
+
+        if managed.pending_submission.is_some()
+            && !managed.cancel_processed
+            && now < round_cancel_at(&managed.round, strategy)
+        {
+            self.recover_timed_out_submission(managed).await?;
         }
 
         if strategy.uses_open_post_price_guard()
@@ -332,7 +328,7 @@ impl<'a> Orchestrator<'a> {
             && !managed.cancel_processed
             && now < round_cancel_at(&managed.round, strategy)
         {
-            self.monitor_open_post_price_guard(strategy, managed).await?;
+            self.monitor_open_post_strategy(managed).await?;
         }
 
         if strategy.uses_reactive_taker_flip()
@@ -1352,6 +1348,10 @@ impl<'a> Orchestrator<'a> {
         strategy: &StrategySnapshot,
         managed: &mut ManagedRound,
     ) -> Result<()> {
+        if strategy.uses_open_post_price_guard() {
+            managed.submission_attempted = true;
+        }
+
         if matches!(strategy.mode, StrategyMode::PreSplitDualSell) && !managed.split_confirmed {
             if managed.split_attempted {
                 info!(
@@ -1425,7 +1425,40 @@ impl<'a> Orchestrator<'a> {
             .iter()
             .map(|(_, payload)| payload.clone())
             .collect::<Vec<_>>();
-        let responses = gateway.post_orders(&raw_orders).await?;
+        let responses = match gateway.post_orders(&raw_orders).await {
+            Ok(responses) => responses,
+            Err(error) if is_request_timeout_error(&error) => {
+                let plans = payloads
+                    .iter()
+                    .map(|(plan, _)| plan.clone())
+                    .collect::<Vec<_>>();
+                managed.orders_submitted = true;
+                managed.pending_submission = Some(PendingSubmissionRecovery::new(plans));
+                warn!(
+                    ?error,
+                    condition_id = %managed.round.condition_id,
+                    market_slug = %managed.round.market_slug,
+                    order_count = payloads.len(),
+                    "batch order request timed out after submit attempt; entering recovery mode to avoid duplicate reposts"
+                );
+                self.recover_timed_out_submission(managed).await?;
+                return Ok(());
+            }
+            Err(error) => {
+                if strategy.uses_open_post_price_guard() {
+                    managed.cancel_processed = true;
+                    managed.completed = true;
+                    warn!(
+                        ?error,
+                        condition_id = %managed.round.condition_id,
+                        market_slug = %managed.round.market_slug,
+                        "open-post single submission attempt failed; skipping this round"
+                    );
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         if responses.len() != payloads.len() {
             return Err(anyhow::anyhow!(
                 "expected {} batch responses, received {}",
@@ -1435,6 +1468,7 @@ impl<'a> Orchestrator<'a> {
         }
 
         managed.orders_submitted = true;
+        managed.pending_submission = None;
         managed.orders.clear();
 
         for ((plan, _), response) in payloads.into_iter().zip(responses.into_iter()) {
@@ -1487,21 +1521,81 @@ impl<'a> Orchestrator<'a> {
         managed.orders.push(ManagedOrder::rejected(plan, response));
     }
 
-    async fn monitor_open_post_price_guard(
-        &self,
-        strategy: &StrategySnapshot,
-        managed: &mut ManagedRound,
-    ) -> Result<()> {
-        if !strategy.uses_open_post_price_guard() {
+    async fn recover_timed_out_submission(&self, managed: &mut ManagedRound) -> Result<()> {
+        let Some(recovery) = managed.pending_submission.as_mut() else {
+            return Ok(());
+        };
+        if !recovery.should_check_now() {
             return Ok(());
         }
 
-        self.refresh_open_reference_snapshot(managed).await?;
-        self.apply_open_post_observation_gate(strategy, managed)?;
-        if managed.completed || managed.cancel_processed {
-            return Ok(());
+        recovery.last_check_at = Some(Utc::now());
+        let gateway = self.live_gateway()?;
+        let open_orders = gateway
+            .fetch_open_orders(Some(&managed.round.market_id), None)
+            .await?;
+
+        let mut recovered = Vec::new();
+        for plan in &recovery.plans {
+            if managed
+                .orders
+                .iter()
+                .any(|order| order.leg == plan.leg && order.side == plan.side)
+            {
+                continue;
+            }
+
+            let token_id = gateway
+                .token_id_for_leg(&managed.round, plan.leg)?
+                .to_string();
+            let Some(open_order) = open_orders.iter().find(|order| {
+                order.id.trim().len() > 0
+                    && order.asset_id == token_id
+                    && order_side_matches_open_order(plan.side, &order.side)
+                    && order.price == Some(plan.price)
+                    && order.original_size == Some(plan.size)
+                    && !managed
+                        .orders
+                        .iter()
+                        .any(|existing| existing.order_id.as_deref() == Some(order.id.as_str()))
+                    && !recovered.iter().any(|existing: &ManagedOrder| {
+                        existing.order_id.as_deref() == Some(order.id.as_str())
+                    })
+            }) else {
+                continue;
+            };
+
+            recovered.push(ManagedOrder::from_open_order(plan.clone(), open_order));
         }
 
+        for order in recovered {
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                leg = leg_label(order.leg),
+                side = side_label(order.side),
+                price = %order.price,
+                size = %order.size,
+                order_id = %order.order_id.as_deref().unwrap_or(""),
+                "recovered open order after batch submit timeout"
+            );
+            managed.orders.push(order);
+        }
+
+        if managed.orders.len() >= recovery.plans.len() {
+            managed.pending_submission = None;
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                recovered_orders = managed.orders.len(),
+                "submission recovery completed"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn monitor_open_post_strategy(&self, managed: &mut ManagedRound) -> Result<()> {
         let mut first_matched_leg = None;
 
         if !self.settings.app.dry_run {
@@ -1556,12 +1650,7 @@ impl<'a> Orchestrator<'a> {
         }
 
         if let Some(filled_leg) = first_matched_leg {
-            self.cancel_opposite_leg_after_first_match(managed, filled_leg)
-                .await?;
-        }
-
-        if self.open_price_guard_failed(strategy, managed)? {
-            self.cancel_resting_orders(strategy, managed).await?;
+            self.note_open_post_first_match(managed, filled_leg);
         }
 
         Ok(())
@@ -2008,6 +2097,14 @@ impl<'a> Orchestrator<'a> {
             return Ok(());
         }
 
+        if managed.pending_submission.is_some() && managed.orders.is_empty() {
+            warn!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                "submit timeout recovery did not recover any open-order ids before cancel window; manual audit may be required"
+            );
+        }
+
         let live_ids = managed
             .orders
             .iter()
@@ -2058,132 +2155,12 @@ impl<'a> Orchestrator<'a> {
         Ok(())
     }
 
-    async fn refresh_open_reference_snapshot(&self, managed: &mut ManagedRound) -> Result<()> {
+    fn note_open_post_first_match(&self, managed: &mut ManagedRound, filled_leg: LegSide) {
         let Some(state) = managed.open_post_state.as_mut() else {
-            return Ok(());
-        };
-
-        if state.snapshot_fetched_at.map_or(false, |fetched_at| {
-            Utc::now()
-                .signed_duration_since(fetched_at)
-                .num_milliseconds()
-                < OPEN_PRICE_SNAPSHOT_MIN_POLL_MS
-        }) {
-            return Ok(());
-        }
-
-        let snapshot = self
-            .market_discovery
-            .fetch_round_reference_price_snapshot(&managed.round)
-            .await?;
-        if let Some(snapshot) = snapshot {
-            state.update_snapshot(snapshot.clone());
-            debug!(
-                condition_id = %managed.round.condition_id,
-                market_slug = %managed.round.market_slug,
-                open_price = %snapshot.open_price,
-                current_price = %snapshot.current_price,
-                open_source = %snapshot.open_source,
-                current_source = %snapshot.current_source,
-                "refreshed PM reference price snapshot"
-            );
-        }
-
-        Ok(())
-    }
-
-    fn open_price_guard_failed(
-        &self,
-        strategy: &StrategySnapshot,
-        managed: &mut ManagedRound,
-    ) -> Result<bool> {
-        let Some(state) = managed.open_post_state.as_mut() else {
-            return Ok(false);
-        };
-        let Some(snapshot) = state.latest_snapshot.as_ref() else {
-            return Ok(false);
-        };
-
-        let drift = (snapshot.current_price - snapshot.open_price).abs();
-        if drift <= strategy.open_price_max_deviation {
-            return Ok(false);
-        }
-
-        if state.price_guard_failed {
-            return Ok(false);
-        }
-
-        state.price_guard_failed = true;
-        warn!(
-            condition_id = %managed.round.condition_id,
-            market_slug = %managed.round.market_slug,
-            open_price = %snapshot.open_price,
-            current_price = %snapshot.current_price,
-            drift = %drift,
-            max_drift = %strategy.open_price_max_deviation,
-            open_source = %snapshot.open_source,
-            current_source = %snapshot.current_source,
-            "PM price drift exceeded configured threshold; canceling all resting orders"
-        );
-        Ok(true)
-    }
-
-    fn apply_open_post_observation_gate(
-        &self,
-        strategy: &StrategySnapshot,
-        managed: &mut ManagedRound,
-    ) -> Result<()> {
-        let now = Utc::now();
-        let Some(state) = managed.open_post_state.as_mut() else {
-            return Ok(());
-        };
-        let Some(snapshot) = state.latest_snapshot.as_ref() else {
-            return Ok(());
-        };
-
-        let drift = (snapshot.current_price - snapshot.open_price).abs();
-        let entry_at = round_quote_start_at(&managed.round, strategy);
-
-        if now >= managed.round.opens_at
-            && now < entry_at
-            && drift >= strategy.open_price_observation_max_deviation
-            && !state.observation_disqualified
-        {
-            state.observation_disqualified = true;
-            warn!(
-                condition_id = %managed.round.condition_id,
-                market_slug = %managed.round.market_slug,
-                open_price = %snapshot.open_price,
-                current_price = %snapshot.current_price,
-                drift = %drift,
-                disqualify_drift = %strategy.open_price_observation_max_deviation,
-                "PM price drift hit first-minute observation threshold; skipping this round"
-            );
-        }
-
-        if now >= entry_at && state.observation_disqualified && !managed.completed {
-            managed.completed = true;
-            managed.cancel_processed = true;
-            info!(
-                condition_id = %managed.round.condition_id,
-                market_slug = %managed.round.market_slug,
-                "round skipped after first-minute observation threshold was breached"
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn cancel_opposite_leg_after_first_match(
-        &self,
-        managed: &mut ManagedRound,
-        filled_leg: LegSide,
-    ) -> Result<()> {
-        let Some(state) = managed.open_post_state.as_mut() else {
-            return Ok(());
+            return;
         };
         if state.triggered_leg.is_some() {
-            return Ok(());
+            return;
         }
 
         state.triggered_leg = Some(filled_leg);
@@ -2192,47 +2169,8 @@ impl<'a> Orchestrator<'a> {
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
             filled_leg = leg_label(filled_leg),
-            "first maker match observed; canceling the opposite leg"
+            "first maker match observed; keeping the opposite leg live until cancel window"
         );
-
-        if self.settings.app.dry_run {
-            for order in &mut managed.orders {
-                if order.leg != filled_leg && order.needs_cancel() {
-                    order.mark_canceled();
-                }
-            }
-            return Ok(());
-        }
-
-        let live_ids = managed
-            .orders
-            .iter()
-            .filter(|order| order.leg != filled_leg && order.needs_cancel())
-            .filter_map(|order| order.order_id.as_deref())
-            .collect::<Vec<_>>();
-        if live_ids.is_empty() {
-            return Ok(());
-        }
-
-        let gateway = self.live_gateway()?;
-        let response = gateway.cancel_orders(&live_ids).await?;
-        for order in &mut managed.orders {
-            let Some(order_id) = order.order_id.as_deref() else {
-                continue;
-            };
-            if order.leg == filled_leg {
-                continue;
-            }
-            if response.canceled.iter().any(|canceled| canceled == order_id) {
-                order.mark_canceled();
-                continue;
-            }
-            if let Some(reason) = response.not_canceled.get(order_id) {
-                order.mark_cancel_failed(reason.clone());
-            }
-        }
-
-        Ok(())
     }
 
     async fn finalize_round(
@@ -2407,8 +2345,10 @@ struct ManagedRound {
     split_attempted: bool,
     split_confirmed: bool,
     split_error: Option<String>,
+    submission_attempted: bool,
     orders_submitted: bool,
     orders: Vec<ManagedOrder>,
+    pending_submission: Option<PendingSubmissionRecovery>,
     paper_state: Option<PaperRoundState>,
     open_post_state: Option<OpenPostRoundState>,
     redeem_task_spawned: bool,
@@ -2423,8 +2363,10 @@ impl ManagedRound {
             split_attempted: false,
             split_confirmed: false,
             split_error: None,
+            submission_attempted: false,
             orders_submitted: false,
             orders: Vec::new(),
+            pending_submission: None,
             paper_state: None,
             open_post_state: Some(OpenPostRoundState::new()),
             redeem_task_spawned: false,
@@ -2435,28 +2377,39 @@ impl ManagedRound {
 }
 
 #[derive(Debug, Clone)]
+struct PendingSubmissionRecovery {
+    plans: Vec<OrderPlan>,
+    last_check_at: Option<DateTime<Utc>>,
+}
+
+impl PendingSubmissionRecovery {
+    fn new(plans: Vec<OrderPlan>) -> Self {
+        Self {
+            plans,
+            last_check_at: None,
+        }
+    }
+
+    fn should_check_now(&self) -> bool {
+        self.last_check_at.map_or(true, |last_check_at| {
+            Utc::now()
+                .signed_duration_since(last_check_at)
+                .num_milliseconds()
+                >= SUBMISSION_RECOVERY_POLL_MS
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct OpenPostRoundState {
     triggered_leg: Option<LegSide>,
-    latest_snapshot: Option<RoundReferencePriceSnapshot>,
-    snapshot_fetched_at: Option<DateTime<Utc>>,
-    observation_disqualified: bool,
-    price_guard_failed: bool,
 }
 
 impl OpenPostRoundState {
     fn new() -> Self {
         Self {
             triggered_leg: None,
-            latest_snapshot: None,
-            snapshot_fetched_at: None,
-            observation_disqualified: false,
-            price_guard_failed: false,
         }
-    }
-
-    fn update_snapshot(&mut self, snapshot: RoundReferencePriceSnapshot) {
-        self.snapshot_fetched_at = Some(Utc::now());
-        self.latest_snapshot = Some(snapshot);
     }
 }
 
@@ -2500,6 +2453,27 @@ impl ManagedOrder {
             last_matched_size: Decimal::ZERO,
             trigger_attempted: false,
         }
+    }
+
+    fn from_open_order(plan: OrderPlan, open_order: &OpenOrderResponse) -> Self {
+        let mut managed = Self {
+            leg: plan.leg,
+            side: plan.side,
+            price: plan.price,
+            size: plan.size,
+            order_id: Some(open_order.id.clone()),
+            status: ManagedOrderStatus::Live,
+            exchange_status: open_order.status.clone(),
+            error_message: None,
+            last_matched_size: Decimal::ZERO,
+            trigger_attempted: false,
+        };
+
+        if let Some(size_matched) = open_order.size_matched {
+            managed.observe_realtime_status(size_matched, &open_order.status);
+        }
+
+        managed
     }
 
     fn rejected(plan: OrderPlan, response: PostOrderResponse) -> Self {
@@ -2849,6 +2823,27 @@ fn should_monitor_paper_round(managed: &ManagedRound) -> bool {
 fn status_implies_filled(status: &str) -> bool {
     let normalized = status.trim().to_ascii_lowercase();
     normalized.contains("matched") || normalized.contains("filled")
+}
+
+fn order_side_matches_open_order(expected: OrderSide, actual: &str) -> bool {
+    let normalized = actual.trim().to_ascii_lowercase();
+    match expected {
+        OrderSide::Buy => normalized == "buy",
+        OrderSide::Sell => normalized == "sell",
+    }
+}
+
+fn is_request_timeout_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|source| source.downcast_ref::<reqwest::Error>())
+        .any(reqwest::Error::is_timeout)
+        || error.chain().any(|source| {
+            source
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("timed out")
+        })
 }
 
 #[cfg(test)]

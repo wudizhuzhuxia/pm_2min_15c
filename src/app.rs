@@ -114,8 +114,7 @@ impl App {
                 after_open_cancel_secs = self.settings.strategy.quote_cancel_after_open_secs,
                 yes_price = self.settings.strategy.yes_price,
                 no_price = self.settings.strategy.no_price,
-                open_price_max_deviation = self.settings.strategy.open_price_max_deviation,
-                "open-post price-guard strategy parameters"
+                "open-post dual-buy strategy parameters"
             );
         }
     }

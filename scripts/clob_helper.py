@@ -91,9 +91,28 @@ def cancel_orders(payload: dict) -> dict:
     return client.cancel_orders(payload["order_ids"])
 
 
+def get_open_orders(payload: dict) -> list[dict]:
+    client = build_client(payload)
+    market = payload.get("market")
+    asset_id = payload.get("asset_id")
+
+    if SDK_FLAVOR == "v2":
+        if market:
+            return client.get_orders(market=market)
+        if asset_id:
+            return client.get_orders(asset_id=asset_id)
+        return client.get_orders()
+
+    if market:
+        return client.get_orders(market=market)
+    if asset_id:
+        return client.get_orders(asset_id=asset_id)
+    return client.get_orders()
+
+
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: clob_helper.py <post-orders|cancel-orders>", file=sys.stderr)
+        print("usage: clob_helper.py <post-orders|cancel-orders|get-open-orders>", file=sys.stderr)
         return 2
 
     action = sys.argv[1]
@@ -103,6 +122,8 @@ def main() -> int:
         result = post_orders(payload)
     elif action == "cancel-orders":
         result = cancel_orders(payload)
+    elif action == "get-open-orders":
+        result = get_open_orders(payload)
     else:
         print(f"unsupported action: {action}", file=sys.stderr)
         return 2

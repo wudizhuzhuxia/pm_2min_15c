@@ -62,9 +62,9 @@ discovery_lookahead_secs = 1200
 # 并 taker 卖掉刚成交的这一边；部分成交不触发，直接持有到结算
 # pre_open_dual_buy_paper_tpsl = 实时模拟盘；盘前双边挂 46c 买单，单边整单成交后，
 # paper taker 买入相反方向的“成交数量 + 额外份数”，并对额外份数按 TP/SL 做模拟，输出日志和盈亏图表
-# open_post_dual_buy_price_guard = 开盘后第 1 分钟只观察价格，第 2 分钟才允许双边挂买单；
-# 首分钟若曾经偏离开盘价超过观察阈值，则整场放弃；挂单后若 PM 自身价格相对开盘价偏移
-# 超过保留阈值，则撤掉未成交挂单；任意一边部分成交后立刻撤另一边
+# open_post_dual_buy_price_guard = 开盘后延迟一段时间再双边挂买单；
+# 在配置的开盘后窗口里只尝试挂单一次，能挂进去就保留到撤单时刻；
+# 若该次尝试没有成功挂进去，则本场直接放弃；任意一边部分成交后立刻撤另一边
 mode = "pre_open_dual_buy_taker_flip"
 
 # round_interval_secs: 每轮市场长度，5 分钟市场填 300，15 分钟市场填 900。
@@ -87,12 +87,12 @@ quote_cancel_before_open_ms = 1000
 pre_split_before_open_secs = 240
 
 # quote_start_after_open_secs: 仅 open_post_dual_buy_price_guard 模式有效。
-# 表示开盘后多少秒开始挂单；例如 60 表示第 1 分钟只观察，从第 2 分钟开始挂。
-quote_start_after_open_secs = 60
+# 表示开盘后多少秒开始挂单；例如 30 表示开盘前 30 秒不下单，第 30 秒开始尝试挂。
+quote_start_after_open_secs = 30
 
 # quote_cancel_after_open_secs: 仅 open_post_dual_buy_price_guard 模式有效。
-# 表示开盘后最多保留挂单多久；例如 120 表示开盘后 2 分钟撤掉所有未成交部分。
-quote_cancel_after_open_secs = 120
+# 表示开盘后最多保留挂单多久；例如 270 表示挂单最晚保留到开盘后第 270 秒。
+quote_cancel_after_open_secs = 270
 
 # order_size:
 # pre_split_dual_sell 模式下表示每条腿的挂卖数量，同时也是默认 split 数量。
@@ -103,20 +103,18 @@ order_size = 5.0
 # 两条腿各自的挂单价格。
 # pre_split_dual_sell 模式下通常是卖价，比如 0.54。
 # pre_open_dual_buy / pre_open_dual_buy_taker_flip / pre_open_dual_buy_paper_tpsl /
-# open_post_dual_buy_price_guard 模式下通常是买价，比如 0.46 或 0.15。
-yes_price = 0.46
-no_price = 0.46
+# open_post_dual_buy_price_guard 模式下通常是买价，比如 0.10 或 0.15。
+yes_price = 0.10
+no_price = 0.10
 
 # open_price_observation_max_deviation:
 # 仅 open_post_dual_buy_price_guard 模式有效。
-# 首个观察窗口里，只要 PM 当前参考价格相对本场开盘参考价格曾经偏离超过这个值，
-# 整个场次就直接跳过，不再开单。
+# 当前版本已不使用价格观察跳过逻辑；保留该字段仅为了兼容旧配置。
 open_price_observation_max_deviation = 80.0
 
 # open_price_max_deviation:
 # 仅 open_post_dual_buy_price_guard 模式有效。
-# 第 2 分钟挂单窗口内，PM 当前参考价格相对该场次开盘参考价格允许偏离的最大美元数；
-# 超出后撤销所有未成交挂单。
+# 当前版本已不使用价格保护撤单逻辑；保留该字段仅为了兼容旧配置。
 open_price_max_deviation = 50.0
 
 # reactive_opposite_taker_usdc:
