@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::{
+    binance::{BinanceFilterSnapshot, BinanceMarketDataService},
     config::{Settings, StrategyMode},
     execution::{
         ExecutionGateway, OpenOrderResponse, OrderBookResponse, OrderStatusResponse, OrderType,
@@ -38,6 +39,7 @@ pub struct Orchestrator<'a> {
     settings: &'a Settings,
     notifier: &'a Notifier,
     market_discovery: &'a MarketDiscoveryService,
+    binance_market_data: &'a BinanceMarketDataService,
     execution_gateway: Option<Arc<ExecutionGateway>>,
 }
 
@@ -46,12 +48,14 @@ impl<'a> Orchestrator<'a> {
         settings: &'a Settings,
         notifier: &'a Notifier,
         market_discovery: &'a MarketDiscoveryService,
+        binance_market_data: &'a BinanceMarketDataService,
         execution_gateway: Option<Arc<ExecutionGateway>>,
     ) -> Self {
         Self {
             settings,
             notifier,
             market_discovery,
+            binance_market_data,
             execution_gateway,
         }
     }
@@ -59,6 +63,7 @@ impl<'a> Orchestrator<'a> {
     pub async fn run_forever(&self) -> Result<()> {
         let strategy = StrategySnapshot::from_config(&self.settings.strategy)?;
         let mut managed = HashMap::<String, ManagedRound>::new();
+        let mut natural_cycle_counter = 0usize;
         let mut next_discovery_at = Utc::now();
         let mut paper_runtime = if strategy.uses_paper_trading() {
             let runtime = PaperRuntime::new(
@@ -91,7 +96,10 @@ impl<'a> Orchestrator<'a> {
         loop {
             let now = Utc::now();
             if now >= next_discovery_at || managed.len() < strategy.window_size_rounds {
-                if let Err(error) = self.refresh_managed_rounds(&strategy, &mut managed).await {
+                if let Err(error) = self
+                    .refresh_managed_rounds(&strategy, &mut managed, &mut natural_cycle_counter)
+                    .await
+                {
                     warn!(?error, "failed to refresh upcoming rounds");
                     self.notify_error(format!("refresh upcoming rounds failed: {error:#}"))
                         .await;
@@ -181,6 +189,7 @@ impl<'a> Orchestrator<'a> {
         &self,
         strategy: &StrategySnapshot,
         managed: &mut HashMap<String, ManagedRound>,
+        natural_cycle_counter: &mut usize,
     ) -> Result<()> {
         let now = Utc::now();
         let lookahead_secs = self.settings.market.discovery_lookahead_secs.max(
@@ -201,7 +210,12 @@ impl<'a> Orchestrator<'a> {
             if managed.contains_key(&round.condition_id) {
                 continue;
             }
-            if round_cancel_at(&round, strategy) <= now {
+            let cycle_slot = if strategy.uses_binance_cycle_up_single() {
+                Some(*natural_cycle_counter % 5)
+            } else {
+                None
+            };
+            if managed_round_cancel_at(&round, strategy, cycle_slot) <= now {
                 continue;
             }
 
@@ -210,6 +224,7 @@ impl<'a> Orchestrator<'a> {
                 market_slug = %round.market_slug,
                 opens_at = %round.opens_at,
                 settles_at = %round.settles_at,
+                cycle_slot = cycle_slot.map(|slot| slot + 1),
                 "tracking future round"
             );
 
@@ -225,7 +240,14 @@ impl<'a> Orchestrator<'a> {
                 }
             }
 
-            managed.insert(round.condition_id.clone(), ManagedRound::new(round));
+            if strategy.uses_binance_cycle_up_single() {
+                *natural_cycle_counter += 1;
+            }
+
+            managed.insert(
+                round.condition_id.clone(),
+                ManagedRound::new(round, cycle_slot),
+            );
         }
 
         Ok(())
@@ -246,8 +268,8 @@ impl<'a> Orchestrator<'a> {
         }
 
         if !managed.orders_submitted
-            && now >= round_quote_start_at(&managed.round, strategy)
-            && now < round_cancel_at(&managed.round, strategy)
+            && now >= managed.quote_start_at(strategy)
+            && now < managed.cancel_at(strategy)
         {
             self.submit_paper_orders(strategy, managed, paper_runtime)
                 .await?;
@@ -264,9 +286,7 @@ impl<'a> Orchestrator<'a> {
             .await?;
         }
 
-        if !paper_pre_open_cancel_processed(managed)
-            && now >= round_cancel_at(&managed.round, strategy)
-        {
+        if !paper_pre_open_cancel_processed(managed) && now >= managed.cancel_at(strategy) {
             self.cancel_paper_resting_orders(managed, paper_runtime)?;
         }
 
@@ -299,6 +319,8 @@ impl<'a> Orchestrator<'a> {
         managed: &mut ManagedRound,
     ) -> Result<()> {
         let now = Utc::now();
+        let quote_start_at = managed.quote_start_at(strategy);
+        let cancel_at = managed.cancel_at(strategy);
 
         if !managed.split_attempted
             && matches!(strategy.mode, StrategyMode::PreSplitDualSell)
@@ -308,38 +330,70 @@ impl<'a> Orchestrator<'a> {
             self.maybe_split_round(strategy, managed).await?;
         }
 
-        if !managed.orders_submitted
-            && !managed.submission_attempted
-            && now >= round_quote_start_at(&managed.round, strategy)
-            && now < round_cancel_at(&managed.round, strategy)
-        {
-            self.maybe_submit_orders(strategy, managed).await?;
+        if !managed.quote_window_logged && now >= quote_start_at && now < cancel_at {
+            managed.quote_window_logged = true;
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                strategy_mode = ?strategy.mode,
+                cycle_slot = managed.cycle_slot.map(|slot| slot + 1),
+                round_opens_at = %managed.round.opens_at,
+                signal_at = %now,
+                quote_start_at = %quote_start_at,
+                cancel_at = %cancel_at,
+                "entry signal window became active"
+            );
         }
 
-        if managed.pending_submission.is_some()
-            && !managed.cancel_processed
-            && now < round_cancel_at(&managed.round, strategy)
+        if !managed.orders_submitted
+            && !managed.submission_attempted
+            && now >= quote_start_at
+            && now < cancel_at
         {
+            if strategy.uses_binance_cycle_up_single() {
+                self.maybe_submit_binance_cycle_orders(strategy, managed)
+                    .await?;
+            } else {
+                self.maybe_submit_orders(strategy, managed).await?;
+            }
+        }
+
+        if managed.pending_submission.is_some() && !managed.cancel_processed && now < cancel_at {
             self.recover_timed_out_submission(managed).await?;
         }
 
-        if strategy.uses_open_post_price_guard()
+        if (strategy.uses_open_post_price_guard() || strategy.uses_binance_cycle_up_single())
             && managed.orders_submitted
             && !managed.cancel_processed
-            && now < round_cancel_at(&managed.round, strategy)
+            && now < cancel_at
         {
-            self.monitor_open_post_strategy(managed).await?;
+            self.monitor_single_sided_open_window_strategy(managed)
+                .await?;
         }
 
         if strategy.uses_reactive_taker_flip()
             && managed.orders_submitted
             && !managed.cancel_processed
-            && now < round_cancel_at(&managed.round, strategy)
+            && now < cancel_at
         {
             self.monitor_reactive_fills(strategy, managed).await?;
         }
 
-        if !managed.cancel_processed && now >= round_cancel_at(&managed.round, strategy) {
+        if !managed.cancel_window_logged && !managed.cancel_processed && now >= cancel_at {
+            managed.cancel_window_logged = true;
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                cycle_slot = managed.cycle_slot.map(|slot| slot + 1),
+                signal_at = %now,
+                cancel_at = %cancel_at,
+                resting_order_count = managed.orders.len(),
+                pending_submission = managed.pending_submission.is_some(),
+                "entry window expired; starting round cleanup"
+            );
+        }
+
+        if !managed.cancel_processed && now >= cancel_at {
             self.cancel_resting_orders(strategy, managed).await?;
         }
 
@@ -390,8 +444,8 @@ impl<'a> Orchestrator<'a> {
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
             order_count = maker_orders.len(),
-            quote_start_at = %round_quote_start_at(&managed.round, strategy),
-            cancel_at = %round_cancel_at(&managed.round, strategy),
+            quote_start_at = %managed.quote_start_at(strategy),
+            cancel_at = %managed.cancel_at(strategy),
             "submitted paper pre-open maker orders"
         );
 
@@ -1383,6 +1437,19 @@ impl<'a> Orchestrator<'a> {
         let gateway = self.live_gateway()?;
         let mut payloads = Vec::with_capacity(plans.len());
         for plan in plans {
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                cycle_slot = managed.cycle_slot.map(|slot| slot + 1),
+                purpose = plan_purpose(strategy.mode, &plan),
+                leg = leg_label(plan.leg),
+                side = side_label(plan.side),
+                price = %plan.price,
+                size = %plan.size,
+                post_only = plan.post_only,
+                "prepared order plan for submission"
+            );
+
             let payload = match plan.side {
                 OrderSide::Buy => {
                     gateway
@@ -1416,8 +1483,8 @@ impl<'a> Orchestrator<'a> {
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
             order_count = payloads.len(),
-            quote_start_at = %round_quote_start_at(&managed.round, strategy),
-            cancel_at = %round_cancel_at(&managed.round, strategy),
+            quote_start_at = %managed.quote_start_at(strategy),
+            cancel_at = %managed.cancel_at(strategy),
             "submitting pre-open CLOB orders"
         );
 
@@ -1445,14 +1512,16 @@ impl<'a> Orchestrator<'a> {
                 return Ok(());
             }
             Err(error) => {
-                if strategy.uses_open_post_price_guard() {
+                if strategy.uses_open_post_price_guard() || strategy.uses_binance_cycle_up_single()
+                {
                     managed.cancel_processed = true;
                     managed.completed = true;
                     warn!(
                         ?error,
                         condition_id = %managed.round.condition_id,
                         market_slug = %managed.round.market_slug,
-                        "open-post single submission attempt failed; skipping this round"
+                        cycle_slot = managed.cycle_slot.map(|slot| slot + 1),
+                        "single-attempt entry submission failed; skipping this round"
                     );
                     return Ok(());
                 }
@@ -1476,6 +1545,57 @@ impl<'a> Orchestrator<'a> {
         }
 
         Ok(())
+    }
+
+    async fn maybe_submit_binance_cycle_orders(
+        &self,
+        strategy: &StrategySnapshot,
+        managed: &mut ManagedRound,
+    ) -> Result<()> {
+        managed.submission_attempted = true;
+
+        let snapshot = self
+            .binance_market_data
+            .evaluate_support_and_rsi(
+                strategy.binance_support_lookback_candles,
+                strategy.binance_support_tolerance_ratio,
+                strategy.binance_ema_period,
+                strategy.binance_rsi_period,
+                strategy.binance_rsi_max,
+            )
+            .await?;
+        managed.binance_filter_snapshot = Some(snapshot.clone());
+
+        if !snapshot.support_hit || !snapshot.rsi_pass {
+            managed.cancel_processed = true;
+            managed.completed = true;
+            info!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                cycle_slot = managed.cycle_slot.unwrap_or(0) + 1,
+                symbol = %snapshot.symbol,
+                current_price = %snapshot.current_price,
+                support_hit = snapshot.support_hit,
+                support_reason = snapshot.support_reason.as_deref().unwrap_or(""),
+                rsi_value = %snapshot.rsi_value,
+                rsi_pass = snapshot.rsi_pass,
+                "binance cycle filters rejected this round; skipping order placement"
+            );
+            return Ok(());
+        }
+
+        info!(
+            condition_id = %managed.round.condition_id,
+            market_slug = %managed.round.market_slug,
+            cycle_slot = managed.cycle_slot.unwrap_or(0) + 1,
+            symbol = %snapshot.symbol,
+            current_price = %snapshot.current_price,
+            support_reason = snapshot.support_reason.as_deref().unwrap_or(""),
+            rsi_value = %snapshot.rsi_value,
+            "binance cycle filters passed; submitting single up order"
+        );
+
+        self.maybe_submit_orders(strategy, managed).await
     }
 
     fn record_order_response(
@@ -1502,23 +1622,41 @@ impl<'a> Orchestrator<'a> {
                 "order accepted by CLOB"
             );
             managed.orders.push(ManagedOrder::live(plan, response));
-            return;
+        } else {
+            warn!(
+                condition_id = %managed.round.condition_id,
+                market_slug = %managed.round.market_slug,
+                purpose,
+                leg = leg_label(plan.leg),
+                side = side_label(plan.side),
+                price = %plan.price,
+                size = %plan.size,
+                post_only_cross = response.is_post_only_would_cross(),
+                error = error_message.as_deref().unwrap_or("unknown"),
+                raw_status = %response.status,
+                "order was not resting after batch submission"
+            );
+            managed.orders.push(ManagedOrder::rejected(plan, response));
         }
 
-        warn!(
+        info!(
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
-            purpose,
-            leg = leg_label(plan.leg),
-            side = side_label(plan.side),
-            price = %plan.price,
-            size = %plan.size,
-            post_only_cross = response.is_post_only_would_cross(),
-            error = error_message.as_deref().unwrap_or("unknown"),
-            raw_status = %response.status,
-            "order was not resting after batch submission"
+            cycle_slot = managed.cycle_slot.map(|slot| slot + 1),
+            total_orders = managed.orders.len(),
+            live_orders = managed.orders.iter().filter(|order| order.is_live()).count(),
+            matched_orders = managed
+                .orders
+                .iter()
+                .filter(|order| {
+                    matches!(
+                        order.status,
+                        ManagedOrderStatus::PartiallyMatched | ManagedOrderStatus::FullyMatched
+                    )
+                })
+                .count(),
+            "updated round order state after batch response"
         );
-        managed.orders.push(ManagedOrder::rejected(plan, response));
     }
 
     async fn recover_timed_out_submission(&self, managed: &mut ManagedRound) -> Result<()> {
@@ -1595,7 +1733,10 @@ impl<'a> Orchestrator<'a> {
         Ok(())
     }
 
-    async fn monitor_open_post_strategy(&self, managed: &mut ManagedRound) -> Result<()> {
+    async fn monitor_single_sided_open_window_strategy(
+        &self,
+        managed: &mut ManagedRound,
+    ) -> Result<()> {
         let mut first_matched_leg = None;
 
         if !self.settings.app.dry_run {
@@ -2165,11 +2306,16 @@ impl<'a> Orchestrator<'a> {
 
         state.triggered_leg = Some(filled_leg);
         self.maybe_spawn_redeem_watch(managed, "first_match");
+        let has_opposite_live_leg = managed
+            .orders
+            .iter()
+            .any(|order| order.leg != filled_leg && order.needs_cancel());
         info!(
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
             filled_leg = leg_label(filled_leg),
-            "first maker match observed; keeping the opposite leg live until cancel window"
+            has_opposite_live_leg,
+            "first maker match observed"
         );
     }
 
@@ -2342,13 +2488,17 @@ impl<'a> Orchestrator<'a> {
 #[derive(Debug, Clone)]
 struct ManagedRound {
     round: RoundDescriptor,
+    cycle_slot: Option<usize>,
     split_attempted: bool,
     split_confirmed: bool,
     split_error: Option<String>,
+    quote_window_logged: bool,
+    cancel_window_logged: bool,
     submission_attempted: bool,
     orders_submitted: bool,
     orders: Vec<ManagedOrder>,
     pending_submission: Option<PendingSubmissionRecovery>,
+    binance_filter_snapshot: Option<BinanceFilterSnapshot>,
     paper_state: Option<PaperRoundState>,
     open_post_state: Option<OpenPostRoundState>,
     redeem_task_spawned: bool,
@@ -2357,22 +2507,34 @@ struct ManagedRound {
 }
 
 impl ManagedRound {
-    fn new(round: RoundDescriptor) -> Self {
+    fn new(round: RoundDescriptor, cycle_slot: Option<usize>) -> Self {
         Self {
             round,
+            cycle_slot,
             split_attempted: false,
             split_confirmed: false,
             split_error: None,
+            quote_window_logged: false,
+            cancel_window_logged: false,
             submission_attempted: false,
             orders_submitted: false,
             orders: Vec::new(),
             pending_submission: None,
+            binance_filter_snapshot: None,
             paper_state: None,
             open_post_state: Some(OpenPostRoundState::new()),
             redeem_task_spawned: false,
             cancel_processed: false,
             completed: false,
         }
+    }
+
+    fn quote_start_at(&self, strategy: &StrategySnapshot) -> DateTime<Utc> {
+        managed_round_quote_start_at(&self.round, strategy, self.cycle_slot)
+    }
+
+    fn cancel_at(&self, strategy: &StrategySnapshot) -> DateTime<Utc> {
+        managed_round_cancel_at(&self.round, strategy, self.cycle_slot)
     }
 }
 
@@ -2521,6 +2683,13 @@ impl ManagedOrder {
         ) && self.order_id.is_some()
     }
 
+    fn is_live(&self) -> bool {
+        matches!(
+            self.status,
+            ManagedOrderStatus::Live | ManagedOrderStatus::PartiallyMatched
+        )
+    }
+
     fn observe_status(&mut self, status: &OrderStatusResponse) {
         self.exchange_status = status.status.clone();
         if let Some(size_matched) = status.size_matched {
@@ -2583,24 +2752,28 @@ fn plan_purpose(mode: StrategyMode, plan: &OrderPlan) -> &'static str {
         | (StrategyMode::PreOpenDualBuyTakerFlip, LegSide::Yes, OrderSide::Buy)
         | (StrategyMode::PreOpenDualBuyPaperTpsl, LegSide::Yes, OrderSide::Buy)
         | (StrategyMode::PreOpenDualBuyPaperLimitExit, LegSide::Yes, OrderSide::Buy)
-        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::Yes, OrderSide::Buy) => "yes_entry",
+        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::Yes, OrderSide::Buy)
+        | (StrategyMode::BinanceCycleUpSingle, LegSide::Yes, OrderSide::Buy) => "yes_entry",
         (StrategyMode::PreOpenDualBuy, LegSide::No, OrderSide::Buy)
         | (StrategyMode::PreOpenDualBuyTakerFlip, LegSide::No, OrderSide::Buy)
         | (StrategyMode::PreOpenDualBuyPaperTpsl, LegSide::No, OrderSide::Buy)
         | (StrategyMode::PreOpenDualBuyPaperLimitExit, LegSide::No, OrderSide::Buy)
-        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::No, OrderSide::Buy) => "no_entry",
+        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::No, OrderSide::Buy)
+        | (StrategyMode::BinanceCycleUpSingle, LegSide::No, OrderSide::Buy) => "no_entry",
         (StrategyMode::PreSplitDualSell, LegSide::Yes, OrderSide::Buy) => "yes_buy",
         (StrategyMode::PreSplitDualSell, LegSide::No, OrderSide::Buy) => "no_buy",
         (StrategyMode::PreOpenDualBuy, LegSide::Yes, OrderSide::Sell)
         | (StrategyMode::PreOpenDualBuyTakerFlip, LegSide::Yes, OrderSide::Sell)
         | (StrategyMode::PreOpenDualBuyPaperTpsl, LegSide::Yes, OrderSide::Sell)
         | (StrategyMode::PreOpenDualBuyPaperLimitExit, LegSide::Yes, OrderSide::Sell)
-        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::Yes, OrderSide::Sell) => "yes_sell",
+        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::Yes, OrderSide::Sell)
+        | (StrategyMode::BinanceCycleUpSingle, LegSide::Yes, OrderSide::Sell) => "yes_sell",
         (StrategyMode::PreOpenDualBuy, LegSide::No, OrderSide::Sell)
         | (StrategyMode::PreOpenDualBuyTakerFlip, LegSide::No, OrderSide::Sell)
         | (StrategyMode::PreOpenDualBuyPaperTpsl, LegSide::No, OrderSide::Sell)
         | (StrategyMode::PreOpenDualBuyPaperLimitExit, LegSide::No, OrderSide::Sell)
-        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::No, OrderSide::Sell) => "no_sell",
+        | (StrategyMode::OpenPostDualBuyPriceGuard, LegSide::No, OrderSide::Sell)
+        | (StrategyMode::BinanceCycleUpSingle, LegSide::No, OrderSide::Sell) => "no_sell",
     }
 }
 
@@ -2649,19 +2822,43 @@ fn log_reactive_taker_response(
     );
 }
 
-fn round_quote_start_at(round: &RoundDescriptor, strategy: &StrategySnapshot) -> DateTime<Utc> {
-    if strategy.uses_open_post_price_guard() {
+fn managed_round_quote_start_at(
+    round: &RoundDescriptor,
+    strategy: &StrategySnapshot,
+    cycle_slot: Option<usize>,
+) -> DateTime<Utc> {
+    if strategy.uses_binance_cycle_up_single() {
+        round.opens_at
+            + ChronoDuration::seconds(binance_cycle_slot_window(cycle_slot.unwrap_or(0)).0)
+    } else if strategy.uses_open_post_price_guard() {
         round.opens_at + ChronoDuration::seconds(strategy.quote_start_after_open_secs as i64)
     } else {
         round.opens_at - ChronoDuration::seconds(strategy.quote_start_before_open_secs as i64)
     }
 }
 
-fn round_cancel_at(round: &RoundDescriptor, strategy: &StrategySnapshot) -> DateTime<Utc> {
-    if strategy.uses_open_post_price_guard() {
+fn managed_round_cancel_at(
+    round: &RoundDescriptor,
+    strategy: &StrategySnapshot,
+    cycle_slot: Option<usize>,
+) -> DateTime<Utc> {
+    if strategy.uses_binance_cycle_up_single() {
+        round.opens_at
+            + ChronoDuration::seconds(binance_cycle_slot_window(cycle_slot.unwrap_or(0)).1)
+    } else if strategy.uses_open_post_price_guard() {
         round.opens_at + ChronoDuration::seconds(strategy.quote_cancel_after_open_secs as i64)
     } else {
         round.opens_at - ChronoDuration::milliseconds(strategy.quote_cancel_before_open_ms as i64)
+    }
+}
+
+fn binance_cycle_slot_window(slot: usize) -> (i64, i64) {
+    match slot % 5 {
+        0 => (0, 60),
+        1 => (60, 120),
+        2 => (120, 180),
+        3 => (180, 240),
+        _ => (240, 285),
     }
 }
 
@@ -2710,11 +2907,11 @@ fn next_paper_wait_duration(
         }
 
         if !managed_round.orders_submitted {
-            next_wake = next_wake.min(round_quote_start_at(&managed_round.round, strategy));
+            next_wake = next_wake.min(managed_round.quote_start_at(strategy));
         }
 
         if !paper_pre_open_cancel_processed(managed_round) {
-            next_wake = next_wake.min(round_cancel_at(&managed_round.round, strategy));
+            next_wake = next_wake.min(managed_round.cancel_at(strategy));
         }
 
         if let Some(paper_state) = managed_round.paper_state.as_ref() {
@@ -2883,6 +3080,11 @@ mod tests {
             open_price_max_deviation: Decimal::new(50, 0),
             reactive_opposite_taker_usdc: Decimal::ZERO,
             reactive_buy_slippage_ticks: 2,
+            binance_support_lookback_candles: 5,
+            binance_support_tolerance_ratio: Decimal::new(3, 3),
+            binance_ema_period: 20,
+            binance_rsi_period: 14,
+            binance_rsi_max: Decimal::new(35, 0),
             paper_extra_shares: Decimal::new(10, 0),
             paper_stop_loss_price: Decimal::new(50, 2),
             paper_take_profit_percents: vec![Decimal::new(5, 2)],
@@ -2895,7 +3097,7 @@ mod tests {
 
     #[test]
     fn paper_round_keeps_monitoring_after_pre_open_cancel_when_triggered() {
-        let mut managed = ManagedRound::new(sample_round());
+        let mut managed = ManagedRound::new(sample_round(), None);
         managed.orders_submitted = true;
         managed.paper_state = Some(PaperRoundState::new());
 
@@ -2908,7 +3110,7 @@ mod tests {
 
     #[test]
     fn paper_round_stops_monitoring_after_pre_open_cancel_without_trigger() {
-        let mut managed = ManagedRound::new(sample_round());
+        let mut managed = ManagedRound::new(sample_round(), None);
         managed.orders_submitted = true;
         managed.paper_state = Some(PaperRoundState::new());
 
@@ -2921,7 +3123,7 @@ mod tests {
     #[test]
     fn paper_limit_exit_eval_triggers_at_force_taker_deadline() {
         let strategy = sample_strategy(StrategyMode::PreOpenDualBuyPaperLimitExit);
-        let mut managed = ManagedRound::new(sample_round());
+        let mut managed = ManagedRound::new(sample_round(), None);
         managed.paper_state = Some(PaperRoundState::new());
 
         let force_at = paper_force_taker_exit_at(&managed.round, &strategy);
@@ -2949,7 +3151,7 @@ mod tests {
     #[test]
     fn next_paper_wait_duration_wakes_for_limit_exit_force_sell_deadline() {
         let strategy = sample_strategy(StrategyMode::PreOpenDualBuyPaperLimitExit);
-        let mut managed_round = ManagedRound::new(sample_round());
+        let mut managed_round = ManagedRound::new(sample_round(), None);
         managed_round.orders_submitted = true;
         managed_round.paper_state = Some(PaperRoundState::new());
 

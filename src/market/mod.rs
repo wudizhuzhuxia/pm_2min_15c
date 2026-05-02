@@ -255,11 +255,18 @@ impl MarketDiscoveryService {
     }
 
     pub async fn discover_redeemable_rounds(&self, user: &str) -> Result<Vec<RoundDescriptor>> {
-        const PAGE_LIMIT: usize = 500;
+        const PAGE_LIMIT: usize = 100;
         const MAX_OFFSET: usize = 10_000;
 
         let mut offset = 0usize;
         let mut grouped = HashMap::<String, RedeemableRoundBuilder>::new();
+
+        debug!(
+            user,
+            page_limit = PAGE_LIMIT,
+            max_offset = MAX_OFFSET,
+            "scanning redeemable positions for settled rounds"
+        );
 
         loop {
             let positions = self
@@ -801,7 +808,12 @@ impl GammaMarket {
             axis_candidate("yAxisValue", self.y_axis_value, open_price),
             find_extra_decimal(
                 &self.extra,
-                &["currentValue", "currentPrice", "currentPx", "secondsDelayCurrentValue"],
+                &[
+                    "currentValue",
+                    "currentPrice",
+                    "currentPx",
+                    "secondsDelayCurrentValue",
+                ],
             ),
         ];
         let (current_source, current_price) = first_decimal_candidate(&candidate_current_prices)?;
@@ -1070,7 +1082,11 @@ where
 fn first_decimal_candidate<'a>(
     candidates: &'a [Option<(&'a str, Decimal)>],
 ) -> Option<(&'a str, Decimal)> {
-    candidates.iter().flatten().copied().find(|(_, price)| *price > Decimal::ZERO)
+    candidates
+        .iter()
+        .flatten()
+        .copied()
+        .find(|(_, price)| *price > Decimal::ZERO)
 }
 
 fn axis_candidate<'a>(
@@ -1137,7 +1153,10 @@ fn extract_first_price_from_text(text: &str) -> Option<Decimal> {
     }
 
     current.retain(|ch| ch != ',');
-    current.parse::<Decimal>().ok().filter(|value| *value > Decimal::ZERO)
+    current
+        .parse::<Decimal>()
+        .ok()
+        .filter(|value| *value > Decimal::ZERO)
 }
 
 #[cfg(test)]

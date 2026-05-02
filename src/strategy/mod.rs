@@ -32,6 +32,11 @@ pub struct StrategySnapshot {
     pub open_price_max_deviation: Decimal,
     pub reactive_opposite_taker_usdc: Decimal,
     pub reactive_buy_slippage_ticks: u32,
+    pub binance_support_lookback_candles: usize,
+    pub binance_support_tolerance_ratio: Decimal,
+    pub binance_ema_period: usize,
+    pub binance_rsi_period: usize,
+    pub binance_rsi_max: Decimal,
     pub paper_extra_shares: Decimal,
     pub paper_stop_loss_price: Decimal,
     pub paper_take_profit_percents: Vec<Decimal>,
@@ -61,6 +66,13 @@ impl StrategySnapshot {
             open_price_max_deviation: decimal_from_f64(config.open_price_max_deviation)?,
             reactive_opposite_taker_usdc: decimal_from_f64(config.reactive_opposite_taker_usdc)?,
             reactive_buy_slippage_ticks: config.reactive_buy_slippage_ticks,
+            binance_support_lookback_candles: config.binance_support_lookback_candles,
+            binance_support_tolerance_ratio: decimal_percent_to_ratio(
+                config.binance_support_tolerance_percent,
+            )?,
+            binance_ema_period: config.binance_ema_period,
+            binance_rsi_period: config.binance_rsi_period,
+            binance_rsi_max: decimal_from_f64(config.binance_rsi_max)?,
             paper_extra_shares: decimal_from_f64(config.paper_extra_shares)?,
             paper_stop_loss_price: decimal_from_f64(config.paper_stop_loss_price)?,
             paper_take_profit_percents: config
@@ -95,6 +107,10 @@ impl StrategySnapshot {
         self.mode == StrategyMode::OpenPostDualBuyPriceGuard
     }
 
+    pub fn uses_binance_cycle_up_single(&self) -> bool {
+        self.mode == StrategyMode::BinanceCycleUpSingle
+    }
+
     pub fn uses_paper_tpsl(&self) -> bool {
         self.mode == StrategyMode::PreOpenDualBuyPaperTpsl
     }
@@ -111,17 +127,28 @@ impl StrategySnapshot {
         self.uses_reactive_taker_flip() || self.uses_paper_trading()
     }
 
-    pub fn order_plans(&self) -> [OrderPlan; 2] {
+    pub fn order_plans(&self) -> Vec<OrderPlan> {
         let side = match self.mode {
             StrategyMode::PreSplitDualSell => OrderSide::Sell,
             StrategyMode::PreOpenDualBuy
             | StrategyMode::PreOpenDualBuyTakerFlip
             | StrategyMode::PreOpenDualBuyPaperTpsl
             | StrategyMode::PreOpenDualBuyPaperLimitExit
-            | StrategyMode::OpenPostDualBuyPriceGuard => OrderSide::Buy,
+            | StrategyMode::OpenPostDualBuyPriceGuard
+            | StrategyMode::BinanceCycleUpSingle => OrderSide::Buy,
         };
 
-        [
+        if self.uses_binance_cycle_up_single() {
+            return vec![OrderPlan {
+                leg: LegSide::Yes,
+                side,
+                price: self.yes_price,
+                size: self.order_size,
+                post_only: true,
+            }];
+        }
+
+        vec![
             OrderPlan {
                 leg: LegSide::Yes,
                 side,
@@ -193,6 +220,11 @@ mod tests {
             open_price_max_deviation: 50.0,
             reactive_opposite_taker_usdc: 2.0,
             reactive_buy_slippage_ticks: 2,
+            binance_support_lookback_candles: 5,
+            binance_support_tolerance_percent: 0.3,
+            binance_ema_period: 20,
+            binance_rsi_period: 14,
+            binance_rsi_max: 35.0,
             paper_extra_shares: 10.0,
             paper_stop_loss_price: 0.50,
             paper_take_profit_percents: vec![5.0, 10.0, 15.0, 20.0],
@@ -275,5 +307,18 @@ mod tests {
         assert!(matches!(orders[1].side, OrderSide::Buy));
         assert!(snapshot.uses_open_post_price_guard());
         assert!(!snapshot.requires_realtime_quotes());
+    }
+
+    #[test]
+    fn binance_cycle_mode_builds_single_yes_buy_order() {
+        let snapshot =
+            StrategySnapshot::from_config(&sample_config(StrategyMode::BinanceCycleUpSingle))
+                .expect("snapshot");
+        let orders = snapshot.order_plans();
+
+        assert_eq!(orders.len(), 1);
+        assert!(matches!(orders[0].side, OrderSide::Buy));
+        assert!(matches!(orders[0].leg, LegSide::Yes));
+        assert!(snapshot.uses_binance_cycle_up_single());
     }
 }

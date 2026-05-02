@@ -1,4 +1,5 @@
 pub mod app;
+pub mod binance;
 pub mod config;
 pub mod execution;
 pub mod http;

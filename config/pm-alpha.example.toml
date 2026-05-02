@@ -25,6 +25,9 @@ gamma_rest_url = "https://gamma-api.polymarket.com"
 # data_api_url: Data API 地址，用于后台扫描可 redeem 的已结算仓位。
 data_api_url = "https://data-api.polymarket.com"
 
+# binance_rest_url: Binance 公共行情接口地址，用于支撑/RSI 过滤。
+binance_rest_url = "https://api.binance.com"
+
 # polygon_rpc_url_env: Polygon RPC 放在哪个环境变量里。
 polygon_rpc_url_env = "POLYGON_RPC_URL"
 
@@ -51,6 +54,9 @@ tcp_nodelay = true
 # round_interval_secs 需要和这个系列的真实周期一致。
 series_slug = "btc-5m"
 
+# binance_symbol: Binance 用于支撑/RSI 过滤的交易对。
+binance_symbol = "BTCUSDT"
+
 # discovery_lookahead_secs: 向前看多远去发现未来市场，必须覆盖 window_size_rounds。
 discovery_lookahead_secs = 1200
 
@@ -64,7 +70,9 @@ discovery_lookahead_secs = 1200
 # paper taker 买入相反方向的“成交数量 + 额外份数”，并对额外份数按 TP/SL 做模拟，输出日志和盈亏图表
 # open_post_dual_buy_price_guard = 开盘后延迟一段时间再双边挂买单；
 # 在配置的开盘后窗口里只尝试挂单一次，能挂进去就保留到撤单时刻；
-# 若该次尝试没有成功挂进去，则本场直接放弃；任意一边部分成交后立刻撤另一边
+# 若该次尝试没有成功挂进去，则本场直接放弃。
+# binance_cycle_up_single = 启动后跳过当前正在进行中的 5m 场次，从下一场开始按自然场次做 5 场循环；
+# 每场只做单边 Up，先用 Binance 的 15m/30m 支撑过滤 + RSI 过滤，满足才在该场所属窗口挂单。
 mode = "pre_open_dual_buy_taker_flip"
 
 # round_interval_secs: 每轮市场长度，5 分钟市场填 300，15 分钟市场填 900。
@@ -86,12 +94,15 @@ quote_cancel_before_open_ms = 1000
 # 让 split 有时间确认完成，然后再挂单。
 pre_split_before_open_secs = 240
 
-# quote_start_after_open_secs: 仅 open_post_dual_buy_price_guard 模式有效。
+# quote_start_after_open_secs: open_post_dual_buy_price_guard 模式有效。
 # 表示开盘后多少秒开始挂单；例如 30 表示开盘前 30 秒不下单，第 30 秒开始尝试挂。
+# binance_cycle_up_single 模式下不读取这个字段，而是按自然 5 场循环固定窗口：
+# 第 1 场 0-60s，第 2 场 60-120s，第 3 场 120-180s，第 4 场 180-240s，第 5 场 240-285s。
 quote_start_after_open_secs = 30
 
-# quote_cancel_after_open_secs: 仅 open_post_dual_buy_price_guard 模式有效。
+# quote_cancel_after_open_secs: open_post_dual_buy_price_guard 模式有效。
 # 表示开盘后最多保留挂单多久；例如 270 表示挂单最晚保留到开盘后第 270 秒。
+# binance_cycle_up_single 模式下同样不读取这个字段，撤单时间由对应循环窗口结束时刻决定。
 quote_cancel_after_open_secs = 270
 
 # order_size:
@@ -116,6 +127,27 @@ open_price_observation_max_deviation = 80.0
 # 仅 open_post_dual_buy_price_guard 模式有效。
 # 当前版本已不使用价格保护撤单逻辑；保留该字段仅为了兼容旧配置。
 open_price_max_deviation = 50.0
+
+# binance_support_lookback_candles:
+# 仅 binance_cycle_up_single 模式有效。
+# 支撑过滤时回看最近多少根 15m/30m K 线低点。
+binance_support_lookback_candles = 5
+
+# binance_support_tolerance_percent:
+# 仅 binance_cycle_up_single 模式有效。
+# 当前价格距离近期低点或 EMA 支撑线的最大允许偏差百分比。
+binance_support_tolerance_percent = 0.3
+
+# binance_ema_period:
+# 仅 binance_cycle_up_single 模式有效。
+# 支撑过滤里使用的 EMA 周期。
+binance_ema_period = 20
+
+# binance_rsi_period / binance_rsi_max:
+# 仅 binance_cycle_up_single 模式有效。
+# 例如 rsi_period=14, rsi_max=35 表示 RSI(14) < 35 才允许挂单。
+binance_rsi_period = 14
+binance_rsi_max = 35.0
 
 # reactive_opposite_taker_usdc:
 # 仅 pre_open_dual_buy_taker_flip 模式有效。

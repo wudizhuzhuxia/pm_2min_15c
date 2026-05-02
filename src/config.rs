@@ -70,6 +70,10 @@ impl Settings {
             bail!("strategy.no_price must be greater than 0 and less than or equal to 1");
         }
 
+        if self.market.binance_symbol.trim().is_empty() {
+            bail!("market.binance_symbol must not be empty");
+        }
+
         if self.strategy.open_price_observation_max_deviation < 0.0 {
             bail!(
                 "strategy.open_price_observation_max_deviation must be greater than or equal to zero"
@@ -78,6 +82,28 @@ impl Settings {
 
         if self.strategy.open_price_max_deviation < 0.0 {
             bail!("strategy.open_price_max_deviation must be greater than or equal to zero");
+        }
+
+        if self.strategy.binance_support_lookback_candles == 0 {
+            bail!("strategy.binance_support_lookback_candles must be greater than zero");
+        }
+
+        if self.strategy.binance_support_tolerance_percent < 0.0 {
+            bail!(
+                "strategy.binance_support_tolerance_percent must be greater than or equal to zero"
+            );
+        }
+
+        if self.strategy.binance_ema_period == 0 {
+            bail!("strategy.binance_ema_period must be greater than zero");
+        }
+
+        if self.strategy.binance_rsi_period == 0 {
+            bail!("strategy.binance_rsi_period must be greater than zero");
+        }
+
+        if !(0.0..=100.0).contains(&self.strategy.binance_rsi_max) {
+            bail!("strategy.binance_rsi_max must be between 0 and 100");
         }
 
         let round_interval_ms = self.strategy.round_interval_secs.saturating_mul(1_000);
@@ -285,6 +311,7 @@ pub struct NetworkConfig {
     pub relayer_rest_url: String,
     pub gamma_rest_url: String,
     pub data_api_url: String,
+    pub binance_rest_url: String,
     pub polygon_rpc_url_env: String,
     pub prefer_http2: bool,
     pub connect_timeout_ms: u64,
@@ -301,6 +328,7 @@ impl Default for NetworkConfig {
             relayer_rest_url: "https://relayer-v2.polymarket.com".to_owned(),
             gamma_rest_url: "https://gamma-api.polymarket.com".to_owned(),
             data_api_url: "https://data-api.polymarket.com".to_owned(),
+            binance_rest_url: "https://api.binance.com".to_owned(),
             polygon_rpc_url_env: "POLYGON_RPC_URL".to_owned(),
             prefer_http2: true,
             connect_timeout_ms: 200,
@@ -328,6 +356,7 @@ impl NetworkConfig {
 pub struct MarketConfig {
     pub series_slug: String,
     pub discovery_lookahead_secs: u64,
+    pub binance_symbol: String,
 }
 
 impl Default for MarketConfig {
@@ -335,6 +364,7 @@ impl Default for MarketConfig {
         Self {
             series_slug: "btc-5m".to_owned(),
             discovery_lookahead_secs: 1_200,
+            binance_symbol: "BTCUSDT".to_owned(),
         }
     }
 }
@@ -348,6 +378,7 @@ pub enum StrategyMode {
     PreOpenDualBuyPaperTpsl,
     PreOpenDualBuyPaperLimitExit,
     OpenPostDualBuyPriceGuard,
+    BinanceCycleUpSingle,
 }
 
 impl Default for StrategyMode {
@@ -374,6 +405,11 @@ pub struct StrategyConfig {
     pub open_price_max_deviation: f64,
     pub reactive_opposite_taker_usdc: f64,
     pub reactive_buy_slippage_ticks: u32,
+    pub binance_support_lookback_candles: usize,
+    pub binance_support_tolerance_percent: f64,
+    pub binance_ema_period: usize,
+    pub binance_rsi_period: usize,
+    pub binance_rsi_max: f64,
     pub paper_extra_shares: f64,
     pub paper_stop_loss_price: f64,
     pub paper_take_profit_percents: Vec<f64>,
@@ -401,6 +437,11 @@ impl Default for StrategyConfig {
             open_price_max_deviation: 50.0,
             reactive_opposite_taker_usdc: 2.0,
             reactive_buy_slippage_ticks: 2,
+            binance_support_lookback_candles: 5,
+            binance_support_tolerance_percent: 0.3,
+            binance_ema_period: 20,
+            binance_rsi_period: 14,
+            binance_rsi_max: 35.0,
             paper_extra_shares: 10.0,
             paper_stop_loss_price: 0.50,
             paper_take_profit_percents: vec![5.0, 10.0, 15.0, 20.0],

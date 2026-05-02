@@ -1,0 +1,111 @@
+# BTC 5m Binance 支撑 + RSI 单边 Up 循环策略示例
+# 这份配置按你的需求预设：
+# - PM BTC 5m
+# - 启动后跳过当前正在进行中的场次
+# - 从下一场开始按自然场次做 5 场循环
+# - 第 1 场窗口: 0-60s
+# - 第 2 场窗口: 60-120s
+# - 第 3 场窗口: 120-180s
+# - 第 4 场窗口: 180-240s
+# - 第 5 场窗口: 240-285s
+# - 只做单边 Up
+# - 价格 10c，数量 5 股
+# - 挂单前先检查 Binance 15m/30m 支撑区域 + RSI(14) < 35
+
+[app]
+instance_name = "btc-5m-binance-cycle-up"
+dry_run = false
+log_level = "info"
+
+[network]
+clob_rest_url = "https://clob.polymarket.com"
+relayer_rest_url = "https://relayer-v2.polymarket.com"
+gamma_rest_url = "https://gamma-api.polymarket.com"
+data_api_url = "https://data-api.polymarket.com"
+binance_rest_url = "https://api.binance.com"
+polygon_rpc_url_env = "POLYGON_RPC_URL"
+prefer_http2 = true
+connect_timeout_ms = 300
+request_timeout_ms = 1200
+keepalive_interval_secs = 20
+transaction_timeout_secs = 45
+tcp_nodelay = true
+
+[market]
+series_slug = "btc-5m"
+binance_symbol = "BTCUSDT"
+discovery_lookahead_secs = 1200
+
+[strategy]
+mode = "binance_cycle_up_single"
+round_interval_secs = 300
+window_size_rounds = 2
+quote_start_before_open_secs = 180
+quote_cancel_before_open_ms = 1000
+pre_split_before_open_secs = 240
+quote_start_after_open_secs = 30
+quote_cancel_after_open_secs = 270
+order_size = 5.0
+yes_price = 0.10
+no_price = 0.10
+open_price_observation_max_deviation = 80.0
+open_price_max_deviation = 50.0
+reactive_opposite_taker_usdc = 2.0
+reactive_buy_slippage_ticks = 2
+binance_support_lookback_candles = 5
+binance_support_tolerance_percent = 0.3
+binance_ema_period = 20
+binance_rsi_period = 14
+binance_rsi_max = 35.0
+paper_extra_shares = 10.0
+paper_stop_loss_price = 0.50
+paper_take_profit_percents = [5.0, 10.0, 15.0, 20.0]
+paper_limit_exit_price = 0.50
+paper_force_taker_exit_before_settle_secs = 120
+paper_fee_rebate_rate = 0.30
+paper_output_dir = "logs/paper"
+
+[execution]
+max_batch_orders = 15
+clob_execution_mode = "rust"
+clob_helper_python_bin = "python3"
+clob_helper_script = "scripts/clob_helper.py"
+onchain_execution_mode = "relayer"
+refresh_metadata_on_start = true
+auto_approve_ctf = true
+auto_approve_collateral = true
+relayer_require_safe_deployed = true
+relayer_poll_interval_ms = 2000
+tick_size = "0.01"
+neg_risk = false
+fee_rate_bps = 0
+settled_redeem_scan_enabled = true
+settled_redeem_scan_interval_secs = 60
+settled_redeem_scan_lookback_secs = 21600
+
+[routing]
+primary_account = "acc1"
+
+[telemetry]
+log_json = true
+
+[telegram]
+enabled = false
+bot_token_env = "PM_TELEGRAM_BOT_TOKEN"
+chat_ids = []
+send_startup = true
+send_shutdown = true
+send_errors = true
+disable_link_preview = true
+
+[[accounts]]
+name = "acc1"
+enabled = true
+private_key_env = "PM_ACC1_PRIVATE_KEY"
+api_key_env = "PM_ACC1_API_KEY"
+api_secret_env = "PM_ACC1_API_SECRET"
+api_passphrase_env = "PM_ACC1_API_PASSPHRASE"
+funder_address = "0x0000000000000000000000000000000000000000"
+signature_type = "gnosis_safe"
+relayer_api_key_env = "PM_ACC1_RELAYER_API_KEY"
+relayer_api_key_address_env = "PM_ACC1_RELAYER_API_KEY_ADDRESS"
