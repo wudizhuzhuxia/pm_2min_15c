@@ -5,7 +5,6 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::{
-    binance::BinanceMarketDataService,
     config::{Settings, StrategyMode},
     execution::{ExecutionGateway, LoadedAccount},
     market::MarketDiscoveryService,
@@ -17,7 +16,6 @@ pub struct App {
     settings: Settings,
     notifier: Notifier,
     market_discovery: MarketDiscoveryService,
-    binance_market_data: BinanceMarketDataService,
     execution_gateway: Option<Arc<ExecutionGateway>>,
 }
 
@@ -29,8 +27,6 @@ impl App {
             &settings.market,
             settings.strategy.round_interval_secs,
         )?;
-        let binance_market_data =
-            BinanceMarketDataService::new(&settings.network, &settings.market)?;
         let execution_gateway = match LoadedAccount::from_config(settings.primary_account()?) {
             Ok(account) => Some(Arc::new(ExecutionGateway::from_account(
                 &settings.network,
@@ -50,7 +46,6 @@ impl App {
             settings,
             notifier,
             market_discovery,
-            binance_market_data,
             execution_gateway,
         })
     }
@@ -64,7 +59,6 @@ impl App {
             &self.settings,
             &self.notifier,
             &self.market_discovery,
-            &self.binance_market_data,
             self.execution_gateway.clone(),
         );
 
@@ -126,15 +120,9 @@ impl App {
 
         if self.settings.strategy.mode == StrategyMode::BinanceCycleUpSingle {
             info!(
-                symbol = %self.settings.market.binance_symbol,
                 order_size = self.settings.strategy.order_size,
                 yes_price = self.settings.strategy.yes_price,
-                support_lookback_candles = self.settings.strategy.binance_support_lookback_candles,
-                support_tolerance_percent = self.settings.strategy.binance_support_tolerance_percent,
-                ema_period = self.settings.strategy.binance_ema_period,
-                rsi_period = self.settings.strategy.binance_rsi_period,
-                rsi_max = self.settings.strategy.binance_rsi_max,
-                "binance cycle up-single strategy parameters"
+                "cycle up-single strategy parameters"
             );
         }
     }

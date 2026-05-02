@@ -10,7 +10,6 @@ use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::{
-    binance::{BinanceFilterSnapshot, BinanceMarketDataService},
     config::{Settings, StrategyMode},
     execution::{
         ExecutionGateway, OpenOrderResponse, OrderBookResponse, OrderStatusResponse, OrderType,
@@ -39,7 +38,6 @@ pub struct Orchestrator<'a> {
     settings: &'a Settings,
     notifier: &'a Notifier,
     market_discovery: &'a MarketDiscoveryService,
-    binance_market_data: &'a BinanceMarketDataService,
     execution_gateway: Option<Arc<ExecutionGateway>>,
 }
 
@@ -48,14 +46,12 @@ impl<'a> Orchestrator<'a> {
         settings: &'a Settings,
         notifier: &'a Notifier,
         market_discovery: &'a MarketDiscoveryService,
-        binance_market_data: &'a BinanceMarketDataService,
         execution_gateway: Option<Arc<ExecutionGateway>>,
     ) -> Self {
         Self {
             settings,
             notifier,
             market_discovery,
-            binance_market_data,
             execution_gateway,
         }
     }
@@ -1554,45 +1550,13 @@ impl<'a> Orchestrator<'a> {
     ) -> Result<()> {
         managed.submission_attempted = true;
 
-        let snapshot = self
-            .binance_market_data
-            .evaluate_support_and_rsi(
-                strategy.binance_support_lookback_candles,
-                strategy.binance_support_tolerance_ratio,
-                strategy.binance_ema_period,
-                strategy.binance_rsi_period,
-                strategy.binance_rsi_max,
-            )
-            .await?;
-        managed.binance_filter_snapshot = Some(snapshot.clone());
-
-        if !snapshot.support_hit || !snapshot.rsi_pass {
-            managed.cancel_processed = true;
-            managed.completed = true;
-            info!(
-                condition_id = %managed.round.condition_id,
-                market_slug = %managed.round.market_slug,
-                cycle_slot = managed.cycle_slot.unwrap_or(0) + 1,
-                symbol = %snapshot.symbol,
-                current_price = %snapshot.current_price,
-                support_hit = snapshot.support_hit,
-                support_reason = snapshot.support_reason.as_deref().unwrap_or(""),
-                rsi_value = %snapshot.rsi_value,
-                rsi_pass = snapshot.rsi_pass,
-                "binance cycle filters rejected this round; skipping order placement"
-            );
-            return Ok(());
-        }
-
         info!(
             condition_id = %managed.round.condition_id,
             market_slug = %managed.round.market_slug,
             cycle_slot = managed.cycle_slot.unwrap_or(0) + 1,
-            symbol = %snapshot.symbol,
-            current_price = %snapshot.current_price,
-            support_reason = snapshot.support_reason.as_deref().unwrap_or(""),
-            rsi_value = %snapshot.rsi_value,
-            "binance cycle filters passed; submitting single up order"
+            quote_start_at = %managed.quote_start_at(strategy),
+            cancel_at = %managed.cancel_at(strategy),
+            "cycle slot became eligible; submitting single up order without external filters"
         );
 
         self.maybe_submit_orders(strategy, managed).await
@@ -2498,7 +2462,6 @@ struct ManagedRound {
     orders_submitted: bool,
     orders: Vec<ManagedOrder>,
     pending_submission: Option<PendingSubmissionRecovery>,
-    binance_filter_snapshot: Option<BinanceFilterSnapshot>,
     paper_state: Option<PaperRoundState>,
     open_post_state: Option<OpenPostRoundState>,
     redeem_task_spawned: bool,
@@ -2520,7 +2483,6 @@ impl ManagedRound {
             orders_submitted: false,
             orders: Vec::new(),
             pending_submission: None,
-            binance_filter_snapshot: None,
             paper_state: None,
             open_post_state: Some(OpenPostRoundState::new()),
             redeem_task_spawned: false,
