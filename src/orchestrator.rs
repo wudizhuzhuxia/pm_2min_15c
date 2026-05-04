@@ -1556,7 +1556,7 @@ impl<'a> Orchestrator<'a> {
             cycle_slot = managed.cycle_slot.unwrap_or(0) + 1,
             quote_start_at = %managed.quote_start_at(strategy),
             cancel_at = %managed.cancel_at(strategy),
-            "cycle slot became eligible; submitting single up order without external filters"
+            "cycle slot became eligible; submitting dual buy orders without external filters"
         );
 
         self.maybe_submit_orders(strategy, managed).await

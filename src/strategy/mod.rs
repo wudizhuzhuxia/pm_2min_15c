@@ -138,16 +138,6 @@ impl StrategySnapshot {
             | StrategyMode::BinanceCycleUpSingle => OrderSide::Buy,
         };
 
-        if self.uses_binance_cycle_up_single() {
-            return vec![OrderPlan {
-                leg: LegSide::Yes,
-                side,
-                price: self.yes_price,
-                size: self.order_size,
-                post_only: true,
-            }];
-        }
-
         vec![
             OrderPlan {
                 leg: LegSide::Yes,
@@ -310,15 +300,17 @@ mod tests {
     }
 
     #[test]
-    fn binance_cycle_mode_builds_single_yes_buy_order() {
+    fn binance_cycle_mode_builds_dual_buy_orders() {
         let snapshot =
             StrategySnapshot::from_config(&sample_config(StrategyMode::BinanceCycleUpSingle))
                 .expect("snapshot");
         let orders = snapshot.order_plans();
 
-        assert_eq!(orders.len(), 1);
+        assert_eq!(orders.len(), 2);
         assert!(matches!(orders[0].side, OrderSide::Buy));
         assert!(matches!(orders[0].leg, LegSide::Yes));
+        assert!(matches!(orders[1].side, OrderSide::Buy));
+        assert!(matches!(orders[1].leg, LegSide::No));
         assert!(snapshot.uses_binance_cycle_up_single());
     }
 }

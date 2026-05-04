@@ -122,7 +122,8 @@ impl App {
             info!(
                 order_size = self.settings.strategy.order_size,
                 yes_price = self.settings.strategy.yes_price,
-                "cycle up-single strategy parameters"
+                no_price = self.settings.strategy.no_price,
+                "cycle dual-buy strategy parameters"
             );
         }
     }
